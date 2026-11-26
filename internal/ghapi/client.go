@@ -583,7 +583,8 @@ func (c *Client) RefKind(ctx context.Context, fullName, name string) (isBranch, 
 }
 
 // RunJobsSpan returns when the earliest job of any attempt of a run started
-// and when the latest one finished (a job still running counts as now). It
+// and when the latest one finished (a job still running counts as now). Both
+// are zero for a run that never started a job. It
 // is the reliable answer to "when did this run execute": the run's own
 // updated_at moves long after it finished.
 func (c *Client) RunJobsSpan(ctx context.Context, fullName string, runID int64) (time.Time, time.Time, error) {
@@ -614,8 +615,8 @@ func (c *Client) RunJobsSpan(ctx context.Context, fullName string, runID int64) 
 		}
 		return nil
 	})
-	if err == nil && seen == 0 {
-		err = fmt.Errorf("%w: run %d has no jobs", ErrNotFound, runID)
-	}
+	// A run with no jobs at all never executed anything (for example one that
+	// failed waiting for approval). It is reported as zero times, no error.
+	_ = seen
 	return first, last, err
 }

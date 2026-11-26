@@ -37,7 +37,7 @@ type UsageReport struct {
 
 // Usage scans every workflow on each repository's default branch.
 func Usage(ctx context.Context, src Source, action string, repos, owners []string, concurrency int) (*UsageReport, error) {
-	targets, err := listTargets(ctx, src, Options{Repos: repos, Owners: owners})
+	targets, targetErrs, err := listTargets(ctx, src, Options{Repos: repos, Owners: owners})
 	if err != nil {
 		return nil, err
 	}
@@ -55,6 +55,12 @@ func Usage(ctx context.Context, src Source, action string, repos, owners []strin
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
+			if e := targetErrs[strings.ToLower(repo.FullName)]; e != nil {
+				mu.Lock()
+				rep.Errors = append(rep.Errors, repo.FullName+": "+e.Error())
+				mu.Unlock()
+				return
+			}
 			rows, err := usageInRepo(ctx, src, res, repo.FullName, action)
 			mu.Lock()
 			defer mu.Unlock()
@@ -105,7 +111,7 @@ func usageInRepo(ctx context.Context, src Source, res *resolver, repo, action st
 			continue
 		}
 		for _, job := range wf.Jobs {
-			for _, f := range res.expand(ctx, repo, "", job.Uses, p, nil, 0, map[string]bool{}) {
+			for _, f := range res.expand(ctx, repo, "", job.Uses, p, nil, 0, newExpansion()) {
 				if !f.Ref.Matches(action) {
 					continue
 				}

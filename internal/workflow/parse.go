@@ -156,7 +156,44 @@ func decode(data []byte) (*yaml.Node, error) {
 	if root.Kind != yaml.MappingNode {
 		return nil, fmt.Errorf("parse yaml: top level is not a mapping")
 	}
+	// yaml.v3 does not limit alias expansion when decoding into a Node, and
+	// every walk here follows aliases. A few hundred bytes of nested aliases
+	// (a "billion laughs" file, which a fork pull request can supply) would
+	// otherwise make a walk take hours. Measure the expanded size first, with
+	// memoisation so the measurement itself is linear.
+	if n := expandedSize(root, map[*yaml.Node]int{}); n > maxExpandedNodes {
+		return nil, fmt.Errorf("parse yaml: the file expands to more than %d nodes through aliases; refusing to read it", maxExpandedNodes)
+	}
 	return root, nil
+}
+
+// maxExpandedNodes is far above any real workflow (a large one expands to a
+// few thousand nodes) and far below what makes a walk slow.
+const maxExpandedNodes = 200_000
+
+// expandedSize counts the nodes a full walk would visit, saturating at
+// maxExpandedNodes+1.
+func expandedSize(n *yaml.Node, memo map[*yaml.Node]int) int {
+	if n == nil {
+		return 0
+	}
+	if v, ok := memo[n]; ok {
+		return v
+	}
+	memo[n] = maxExpandedNodes + 1 // guards a cycle while this node is open
+	size := 1
+	if n.Kind == yaml.AliasNode {
+		size += expandedSize(n.Alias, memo)
+	}
+	for _, c := range n.Content {
+		size += expandedSize(c, memo)
+		if size > maxExpandedNodes {
+			size = maxExpandedNodes + 1
+			break
+		}
+	}
+	memo[n] = size
+	return size
 }
 
 // deref follows YAML aliases (`*name`) to the node they point at. GitHub

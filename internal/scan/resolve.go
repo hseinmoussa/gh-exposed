@@ -144,6 +144,17 @@ func (r *resolver) Notes() []string {
 	return out
 }
 
+// expansion is the state of one job's expansion: the nested files already
+// followed (cycle guard) and the ones that could not be read. A failure is
+// recorded so the caller can mark the run as not fully assessed instead of
+// silently treating a hidden reference as absent.
+type expansion struct {
+	visited  map[string]bool
+	failures []string
+}
+
+func newExpansion() *expansion { return &expansion{visited: map[string]bool{}} }
+
 // expand returns every action a job reaches. repo and sha locate the
 // workflow's own repository at the commit that ran; local references
 // ("./...") resolve there.
@@ -154,7 +165,7 @@ func (r *resolver) Notes() []string {
 // direct match on the action name still holds, but a nested call the
 // attacker added and then removed cannot be seen. Run logs close that gap
 // when they still exist (see --deep).
-func (r *resolver) expand(ctx context.Context, repo, sha string, uses []workflow.Use, file string, chain []Link, depth int, visited map[string]bool) []Found {
+func (r *resolver) expand(ctx context.Context, repo, sha string, uses []workflow.Use, file string, chain []Link, depth int, x *expansion) []Found {
 	var out []Found
 	for _, u := range uses {
 		link := Link{Uses: u.Ref.Raw, File: file, Line: u.Line}
@@ -174,36 +185,36 @@ func (r *resolver) expand(ctx context.Context, repo, sha string, uses []workflow
 		if ref.Owner == "" {
 			key = strings.ToLower(repo) + "/" + ref.Path + "@" + sha
 		}
-		if visited[key] {
+		if x.visited[key] {
 			continue
 		}
-		visited[key] = true
+		x.visited[key] = true
 
 		switch ref.Kind {
 		case workflow.KindAction:
-			a, f := r.action(ctx, ref.Owner+"/"+ref.Repo, ref.Path, ref.Version)
+			a, f := r.action(ctx, ref.Owner+"/"+ref.Repo, ref.Path, ref.Version, x)
 			if a != nil {
-				out = append(out, r.expand(ctx, repo, sha, a.Uses, f, c, depth+1, visited)...)
+				out = append(out, r.expand(ctx, repo, sha, a.Uses, f, c, depth+1, x)...)
 			}
 		case workflow.KindLocalAction:
-			a, f := r.action(ctx, repo, ref.Path, sha)
+			a, f := r.action(ctx, repo, ref.Path, sha, x)
 			if a != nil {
-				out = append(out, r.expand(ctx, repo, sha, a.Uses, f, c, depth+1, visited)...)
+				out = append(out, r.expand(ctx, repo, sha, a.Uses, f, c, depth+1, x)...)
 			}
 		case workflow.KindReusableWorkflow:
-			wf, f := r.workflow(ctx, ref.Owner+"/"+ref.Repo, ref.Path, ref.Version)
+			wf, f := r.workflow(ctx, ref.Owner+"/"+ref.Repo, ref.Path, ref.Version, x)
 			if wf != nil {
 				// Local references inside a called workflow resolve in the
 				// called workflow's repository at the called ref.
 				for _, j := range wf.Jobs {
-					out = append(out, r.expand(ctx, ref.Owner+"/"+ref.Repo, ref.Version, j.Uses, f, c, depth+1, visited)...)
+					out = append(out, r.expand(ctx, ref.Owner+"/"+ref.Repo, ref.Version, j.Uses, f, c, depth+1, x)...)
 				}
 			}
 		case workflow.KindLocalWorkflow:
-			wf, f := r.workflow(ctx, repo, ref.Path, sha)
+			wf, f := r.workflow(ctx, repo, ref.Path, sha, x)
 			if wf != nil {
 				for _, j := range wf.Jobs {
-					out = append(out, r.expand(ctx, repo, sha, j.Uses, f, c, depth+1, visited)...)
+					out = append(out, r.expand(ctx, repo, sha, j.Uses, f, c, depth+1, x)...)
 				}
 			}
 		}
@@ -211,7 +222,10 @@ func (r *resolver) expand(ctx context.Context, repo, sha string, uses []workflow
 	return out
 }
 
-func (r *resolver) action(ctx context.Context, repo, dir, ref string) (*workflow.ActionFile, string) {
+// action reads an action.yml. A missing file is a note (the ref may have
+// been deleted, which GitHub cannot undo); any other failure is also an
+// expansion failure, because the file exists and might hide a nested call.
+func (r *resolver) action(ctx context.Context, repo, dir, ref string, x *expansion) (*workflow.ActionFile, string) {
 	for _, name := range []string{"action.yml", "action.yaml"} {
 		p := path.Join(dir, name)
 		data, err := r.get(ctx, repo, p, ref)
@@ -221,11 +235,13 @@ func (r *resolver) action(ctx context.Context, repo, dir, ref string) (*workflow
 		label := repo + "/" + p + "@" + ref
 		if err != nil {
 			r.note("could not read %s: %v", label, err)
+			x.failures = append(x.failures, "could not read "+label+": "+shortErr(err))
 			return nil, label
 		}
 		a, err := workflow.ParseAction(data)
 		if err != nil {
 			r.note("could not parse %s: %v", label, err)
+			x.failures = append(x.failures, "could not parse "+label+": "+err.Error())
 			return nil, label
 		}
 		return a, label
@@ -234,16 +250,20 @@ func (r *resolver) action(ctx context.Context, repo, dir, ref string) (*workflow
 	return nil, ""
 }
 
-func (r *resolver) workflow(ctx context.Context, repo, p, ref string) (*workflow.File, string) {
+func (r *resolver) workflow(ctx context.Context, repo, p, ref string, x *expansion) (*workflow.File, string) {
 	label := repo + "/" + p + "@" + ref
 	data, err := r.get(ctx, repo, p, ref)
 	if err != nil {
 		r.note("could not read %s: %v", label, err)
+		if !errors.Is(err, ghapi.ErrNotFound) {
+			x.failures = append(x.failures, "could not read "+label+": "+shortErr(err))
+		}
 		return nil, label
 	}
 	wf, err := workflow.ParseWorkflow(data)
 	if err != nil {
 		r.note("could not parse %s: %v", label, err)
+		x.failures = append(x.failures, "could not parse "+label+": "+err.Error())
 		return nil, label
 	}
 	return wf, label

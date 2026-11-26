@@ -28,11 +28,13 @@ type fake struct {
 	secretErr error
 	fileReads int
 	// purged marks repositories whose old run history GitHub has deleted.
-	purged   map[string]bool
-	commits  map[string]string // repo -> default-branch commit at window end
-	branches map[string]bool   // "owner/repo@name"
-	spans    map[string][2]time.Time
-	tags     map[string]bool
+	purged    map[string]bool
+	commits   map[string]string // repo -> default-branch commit at window end
+	branches  map[string]bool   // "owner/repo@name"
+	spans     map[string][2]time.Time
+	countErr  error
+	commitErr error
+	tags      map[string]bool
 }
 
 func newFake() *fake {
@@ -97,12 +99,18 @@ func (f *fake) DownloadRunLogs(_ context.Context, repo string, id int64, attempt
 	return tmp.Name(), nil
 }
 func (f *fake) CountRunsCreatedBefore(_ context.Context, repo string, _ time.Time) (int, error) {
+	if f.countErr != nil {
+		return 0, f.countErr
+	}
 	if f.purged[repo] {
 		return 0, nil
 	}
 	return 1, nil
 }
 func (f *fake) CommitAt(_ context.Context, repo, _ string, _ time.Time) (string, error) {
+	if f.commitErr != nil {
+		return "", f.commitErr
+	}
 	if c, ok := f.commits[repo]; ok {
 		return c, nil
 	}
@@ -442,7 +450,7 @@ func oneRepo(wf string) *fake {
 	return f
 }
 
-func scanOne(t *testing.T, f *fake, o Options) (*Report, RunResult) {
+func scanOne(t *testing.T, f Source, o Options) (*Report, RunResult) {
 	t.Helper()
 	if o.Incident.ID == "" {
 		o.Incident = tj()
@@ -608,11 +616,104 @@ func TestTransientErrorsAreNotCached(t *testing.T) {
 	if rep.Summary.Possible != 1 {
 		t.Errorf("after one 502, the next run must re-read the file and find the nested action: %+v", rep.Summary)
 	}
+	if rep.Summary.Unassessed != 1 || !rep.Incomplete() {
+		t.Errorf("the run that hit the 502 must be kept as not assessed, not dropped: %+v", rep.Summary)
+	}
 }
 
 func TestLowercaseGithubTokenIsNotRotated(t *testing.T) {
 	got := rotation([]RepoResult{{Repo: "o/r", Runs: []RunResult{{ID: 1, Verdict: incident.Confirmed, LeakedSecrets: []string{"github_token", "REAL"}}}}})
 	if len(got) != 1 || got[0].Secret != "REAL" {
 		t.Errorf("rotation = %+v", got)
+	}
+}
+
+func TestRunThatNeverStartedAJobIsCleared(t *testing.T) {
+	f := oneRepo("jobs:\n  a:\n    steps:\n      - uses: tj-actions/changed-files@v1\n")
+	f.runs["o/r"] = []ghapi.Run{run(1, ".github/workflows/a.yml", "s")}
+	f.spans["o/r|1"] = [2]time.Time{} // no jobs
+	_, got := scanOne(t, f, Options{})
+	if got.Verdict != incident.NotAffected || !strings.Contains(strings.Join(got.Reasons, " "), "never started a job") {
+		t.Errorf("got %+v", got)
+	}
+}
+
+func TestMissingRepoIsAnError(t *testing.T) {
+	f := newFake()
+	rep, err := Run(context.Background(), f, Options{Incident: tj(), Repos: []string{"o/gone"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Repos[0].Error != "repository not found, or this token cannot see it" || !rep.Incomplete() {
+		t.Errorf("repo = %+v", rep.Repos[0])
+	}
+}
+
+func purgedRepo() *fake {
+	f := newFake()
+	f.repos["o/r"] = ghapi.Repo{FullName: "o/r", DefaultBranch: "main", CreatedAt: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), Visibility: "private"}
+	f.purged["o/r"] = true
+	f.commits["o/r"] = "c1"
+	f.dirs["o/r|.github/workflows"] = []string{"ci.yml"}
+	return f
+}
+
+func TestFallbackFailuresAreIncomplete(t *testing.T) {
+	// The workflow file at the window commit cannot be read.
+	f := purgedRepo()
+	rep, _ := scanOne(t, f, Options{})
+	if !rep.Incomplete() || len(rep.Repos[0].Incomplete) == 0 {
+		t.Errorf("unreadable fallback workflow must make the scan incomplete: %+v", rep.Repos[0])
+	}
+	// The commit lookup fails.
+	f = purgedRepo()
+	f.commitErr = errors.New("HTTP 502")
+	rep, _ = scanOne(t, f, Options{})
+	if !rep.Incomplete() {
+		t.Errorf("a failed commit lookup must make the scan incomplete: %+v", rep.Repos[0])
+	}
+	// The history check itself fails: the fallback still runs.
+	f = purgedRepo()
+	f.purged["o/r"] = false
+	f.countErr = errors.New("HTTP 502")
+	f.files["o/r|.github/workflows/ci.yml|c1"] = "jobs:\n  a:\n    steps:\n      - uses: tj-actions/changed-files@v44\n"
+	rep, _ = scanOne(t, f, Options{})
+	if rep.Summary.PossibleFiles != 1 || rep.Repos[0].HistoryComplete {
+		t.Errorf("a failed history check must run the fallback: %+v", rep.Summary)
+	}
+	// A nested action in a fallback file that cannot be read.
+	f = purgedRepo()
+	f.files["o/r|.github/workflows/ci.yml|c1"] = "jobs:\n  a:\n    steps:\n      - uses: x/wrap@v1\n"
+	rep, _ = scanOne(t, &flaky{fake: f}, Options{})
+	if !rep.Incomplete() {
+		t.Errorf("an unreadable nested action in a fallback file must make the scan incomplete: %+v", rep.Repos[0])
+	}
+}
+
+func TestFallbackAllSecretsAreListed(t *testing.T) {
+	f := purgedRepo()
+	f.files["o/r|.github/workflows/ci.yml|c1"] = "jobs:\n  a:\n    secrets: inherit\n    uses: o/r/.github/workflows/b.yml@main\n"
+	f.files["o/r|.github/workflows/b.yml|main"] = "jobs:\n  b:\n    steps:\n      - uses: tj-actions/changed-files@v1\n"
+	f.secrets["o/r"] = []string{"DEPLOY_KEY"}
+	rep, _ := scanOne(t, f, Options{})
+	if len(rep.Rotation) != 1 || rep.Rotation[0].Secret != "DEPLOY_KEY" {
+		t.Errorf("rotation = %+v", rep.Rotation)
+	}
+}
+
+func TestRerunOfAnOldRunInsideTheWindow(t *testing.T) {
+	f := oneRepo("jobs:\n  a:\n    steps:\n      - uses: tj-actions/changed-files@v1\n")
+	r := run(1, ".github/workflows/a.yml", "s")
+	r.CreatedAt = inWindow.Add(-5 * 24 * time.Hour) // created 5 days before
+	r.RunStartedAt = inWindow                       // re-run inside the window
+	r.RunAttempt = 2
+	f.runs["o/r"] = []ghapi.Run{r}
+	_, got := scanOne(t, f, Options{})
+	if got.Verdict != incident.Possible {
+		t.Errorf("a re-run inside the window of an older run must be flagged: %+v", got)
+	}
+	_, got = scanOne(t, f, Options{RerunLookback: 24 * time.Hour})
+	if got.Verdict != incident.NotAffected {
+		t.Errorf("with a 1-day lookback the 5-day-old run is not listed (documented trade-off): %+v", got)
 	}
 }
