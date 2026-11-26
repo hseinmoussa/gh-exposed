@@ -19,8 +19,10 @@ jobs:
           persist-credentials: false
       # Builds gh-exposed for every platform `gh extension install` supports
       # and attaches signed provenance, so users can run
-      # `gh attestation verify` on what they downloaded.
+      # `gh attestation verify` on what they downloaded. GitHub only offers
+      # attestations to private repositories on Enterprise Cloud, so they are
+      # generated once the repository is public.
       - uses: cli/gh-extension-precompile@76961aa3bd1123d0a6fd42d0a41aca0696937c39 # v2.2.0
         with:
           go_version_file: go.mod
-          generate_attestations: true
+          generate_attestations: ${{ !github.event.repository.private }}

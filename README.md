@@ -76,7 +76,7 @@ This needs the [GitHub CLI](https://cli.github.com). Or install with Go:
 go install github.com/hseinmoussa/gh-exposed@latest
 ```
 
-To verify a downloaded release binary was built by this repository's release workflow:
+To verify a downloaded release binary was built by this repository's release workflow (releases from v0.1.1 on; v0.1.0 was built before attestations were enabled):
 
 ```bash
 gh attestation verify <path-to-downloaded-binary> --repo hseinmoussa/gh-exposed
