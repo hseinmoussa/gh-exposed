@@ -1,8 +1,12 @@
 version: 2
 updates:
+  # A cooldown waits 7 days before proposing a new release: most malicious
+  # releases are found and pulled within that time.
   - package-ecosystem: gomod
     directory: /
     schedule: { interval: weekly }
+    cooldown: { default-days: 7 }
   - package-ecosystem: github-actions
     directory: /
     schedule: { interval: weekly }
+    cooldown: { default-days: 7 }
