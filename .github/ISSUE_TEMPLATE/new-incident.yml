@@ -1,0 +1,19 @@
+name: Add an incident
+description: A compromised GitHub Action that should be in the catalogue
+title: "incident: <owner/action>"
+labels: [incident]
+body:
+  - type: input
+    id: advisory
+    attributes:
+      label: GitHub advisory URL
+      placeholder: https://github.com/advisories/GHSA-...
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Window, malicious commits and indicators
+      description: Copy them from the advisory, with links to any other source.
+    validations:
+      required: true

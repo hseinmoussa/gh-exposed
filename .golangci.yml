@@ -1,0 +1,30 @@
+version: "2"
+linters:
+  enable:
+    - bodyclose
+    - errorlint
+    - gosec
+    - misspell
+    - nilerr
+    - revive
+    - unconvert
+  settings:
+    errcheck:
+      # Report rendering writes through errWriter, which keeps the first
+      # error and is checked once at the end of each renderer.
+      exclude-functions:
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - fmt.Fprint
+    gosec:
+      excludes:
+        - G204 # exec of `gh auth token` is intended
+        - G304 # reading the log archive path we created is intended
+    revive:
+      rules:
+        - name: exported
+          disabled: true
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters: [gosec, errcheck]

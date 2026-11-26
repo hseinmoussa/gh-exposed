@@ -105,7 +105,7 @@ func (c *Client) do(ctx context.Context, rawURL, accept string) (*http.Response,
 			return resp, nil
 		}
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		wait, retry := retryAfter(resp, attempt)
 		switch {
 		case resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone:
@@ -193,7 +193,7 @@ func (c *Client) getJSON(ctx context.Context, path string, v any) (http.Header, 
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
 		return nil, fmt.Errorf("decode %s: %w", redactURL(path), err)
 	}
@@ -296,7 +296,7 @@ func (c *Client) GetFile(ctx context.Context, fullName, path, ref string) ([]byt
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	// Workflow and action files are small; 5 MiB is far above any real one
 	// and stops a hostile repository from making us buffer something huge.
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 5<<20))
@@ -424,7 +424,7 @@ func (c *Client) DownloadRunLogs(ctx context.Context, fullName string, runID int
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	f, err := os.CreateTemp("", "gh-exposed-logs-*.zip")
 	if err != nil {
 		return "", err
@@ -438,7 +438,7 @@ func (c *Client) DownloadRunLogs(ctx context.Context, fullName string, runID int
 		err = fmt.Errorf("log archive for run %d is larger than %d bytes; raise --max-log-mb", runID, maxBytes)
 	}
 	if err != nil {
-		os.Remove(f.Name())
+		_ = os.Remove(f.Name())
 		return "", err
 	}
 	return f.Name(), nil
