@@ -93,7 +93,7 @@ Usage:
 Run "gh exposed <command> -h" for the flags of a command.
 
 Exit codes: 0 nothing exposed, 2 possible exposure, 3 confirmed exposure,
-1 error, 64 bad usage.
+1 error or incomplete scan, 64 bad usage.
 
 The token comes from GH_TOKEN, then GITHUB_TOKEN, then "gh auth token".
 It needs read access to the repositories (and to their Actions secrets if
@@ -327,6 +327,11 @@ func cmdScan(ctx context.Context, args []string, env Env) int {
 		return ExitConfirmed
 	case worst == incident.Possible && *failOn == "possible":
 		return ExitPossible
+	case rep.Incomplete():
+		// Nothing was found, but part of the scan failed: that is not a
+		// clean result, and a CI gate must not read it as one.
+		fmt.Fprintln(env.Stderr, "the scan is incomplete (see the report); exiting with an error")
+		return ExitError
 	}
 	return ExitOK
 }

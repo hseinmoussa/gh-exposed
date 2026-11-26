@@ -26,6 +26,10 @@ type Source interface {
 	ListRuns(ctx context.Context, fullName string, start, end time.Time) ([]ghapi.Run, error)
 	DownloadRunLogs(ctx context.Context, fullName string, runID int64, attempt int, maxBytes int64) (string, error)
 	SecretNames(ctx context.Context, fullName string) ([]string, error)
+	CountRunsCreatedBefore(ctx context.Context, fullName string, t time.Time) (int, error)
+	CommitAt(ctx context.Context, fullName, branch string, t time.Time) (string, error)
+	RefKind(ctx context.Context, fullName, name string) (isBranch, isTag bool, err error)
+	RunJobsSpan(ctx context.Context, fullName string, runID int64) (time.Time, time.Time, error)
 }
 
 // Link is one hop in the chain from a workflow to the action that matched.
@@ -50,32 +54,77 @@ const maxDepth = 8
 type resolver struct {
 	src   Source
 	mu    sync.Mutex
-	cache map[string]fetched
+	cache map[string]*fetched
+	refs  map[string]refKind
 	notes map[string]bool
 }
 
+type refKind struct {
+	branch, tag bool
+	err         error
+}
+
+// fetched is one file read. done is closed when data/err are set, so
+// concurrent callers for the same file wait for one request instead of each
+// sending their own.
 type fetched struct {
+	done chan struct{}
 	data []byte
 	err  error
 }
 
 func newResolver(src Source) *resolver {
-	return &resolver{src: src, cache: map[string]fetched{}, notes: map[string]bool{}}
+	return &resolver{src: src, cache: map[string]*fetched{}, refs: map[string]refKind{}, notes: map[string]bool{}}
 }
 
 func (r *resolver) get(ctx context.Context, repo, p, ref string) ([]byte, error) {
 	key := strings.ToLower(repo) + "|" + p + "|" + ref
 	r.mu.Lock()
 	f, ok := r.cache[key]
+	if !ok {
+		f = &fetched{done: make(chan struct{})}
+		r.cache[key] = f
+	}
 	r.mu.Unlock()
 	if ok {
-		return f.data, f.err
+		select {
+		case <-f.done:
+			return f.data, f.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
-	data, err := r.src.GetFile(ctx, repo, p, ref)
+	f.data, f.err = r.src.GetFile(ctx, repo, p, ref)
+	// Keep successes and "not found" only. A transient failure kept here
+	// would hide a nested compromised action from every later run, so it is
+	// returned to the callers already waiting and then forgotten.
+	if f.err != nil && !errors.Is(f.err, ghapi.ErrNotFound) {
+		r.mu.Lock()
+		delete(r.cache, key)
+		r.mu.Unlock()
+	}
+	close(f.done)
+	return f.data, f.err
+}
+
+// onlyBranch reports whether ref names a branch and NOT a tag in repo,
+// caching the answer. Any lookup error counts as "not only a branch", so the
+// caller keeps the more cautious verdict.
+func (r *resolver) onlyBranch(ctx context.Context, repo, ref string) bool {
+	key := strings.ToLower(repo) + "@" + ref
 	r.mu.Lock()
-	r.cache[key] = fetched{data, err}
+	k, ok := r.refs[key]
 	r.mu.Unlock()
-	return data, err
+	if !ok {
+		k.branch, k.tag, k.err = r.src.RefKind(ctx, repo, ref)
+		r.mu.Lock()
+		r.refs[key] = k
+		r.mu.Unlock()
+		if k.err != nil {
+			r.note("could not tell whether %s@%s is a branch or a tag (%v); it was treated as movable", repo, ref, k.err)
+		}
+	}
+	return k.err == nil && k.branch && !k.tag
 }
 
 func (r *resolver) note(format string, a ...any) {

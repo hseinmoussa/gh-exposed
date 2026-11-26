@@ -180,3 +180,55 @@ runs:
 		t.Errorf("node action = %+v, %v", js, err)
 	}
 }
+
+func TestAnchorsAliasesAndMergeKeys(t *testing.T) {
+	src := `
+x-defaults: &defaults
+  runs-on: ubuntu-latest
+  steps: &steps
+    - uses: tj-actions/changed-files@v45
+      env: { A: "${{ Secrets.NPM_TOKEN }}" }
+x-step: &step
+  uses: reviewdog/action-setup@v1
+jobs:
+  merged:
+    <<: *defaults
+  aliased:
+    runs-on: ubuntu-latest
+    steps: *steps
+  item:
+    runs-on: ubuntu-latest
+    steps:
+      - *step
+      - <<: *step
+        with: { x: "${{ SECRETS['AWS_KEY'] }}" }
+  override:
+    <<: *defaults
+    steps:
+      - uses: actions/checkout@v4
+`
+	f, err := ParseWorkflow([]byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]Job{}
+	for _, j := range f.Jobs {
+		byID[j.ID] = j
+	}
+	for _, id := range []string{"merged", "aliased"} {
+		j := byID[id]
+		if len(j.Uses) != 1 || !j.Uses[0].Ref.Matches("tj-actions/changed-files") || len(j.Secrets) != 1 || j.Secrets[0] != "NPM_TOKEN" {
+			t.Errorf("%s = %+v", id, j)
+		}
+	}
+	item := byID["item"]
+	if len(item.Uses) != 2 || !item.Uses[0].Ref.Matches("reviewdog/action-setup") || !item.Uses[1].Ref.Matches("reviewdog/action-setup") {
+		t.Errorf("item uses = %+v", item.Uses)
+	}
+	if len(item.Secrets) != 1 || item.Secrets[0] != "AWS_KEY" {
+		t.Errorf("item secrets = %v", item.Secrets)
+	}
+	if o := byID["override"]; len(o.Uses) != 1 || !o.Uses[0].Ref.Matches("actions/checkout") {
+		t.Errorf("a key written directly must win over a merged one: %+v", o.Uses)
+	}
+}

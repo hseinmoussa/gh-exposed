@@ -100,3 +100,30 @@ func TestParseFormat(t *testing.T) {
 		t.Error("want error")
 	}
 }
+
+func TestHistoryGapRendering(t *testing.T) {
+	r := sample()
+	r.Summary = scan.Summary{Repos: 1, HistoryGaps: 1, PossibleFiles: 1}
+	r.Repos[0].Runs = []scan.RunResult{{Kind: scan.KindWorkflowFile, Workflow: ".github/workflows/ci.yml", Branch: "main",
+		SHA: "c0ffeec0ffeec0ffee", Verdict: incident.Possible, LogStatus: "no run history", Secrets: []string{"BOT_PAT"}}}
+	var b bytes.Buffer
+	if err := Scan(&b, Text, r); err != nil {
+		t.Fatal(err)
+	}
+	s := b.String()
+	for _, want := range []string{"workflow .github/workflows/ci.yml  on main at c0ffeec0ffee  (no run history)", "1 workflow file(s)", "Repos without run history"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("missing %q:\n%s", want, s)
+		}
+	}
+	if strings.Contains(s, "run 0") {
+		t.Error("a workflow-file result must not print as run 0")
+	}
+	r.Repos[0].Runs = nil
+	r.Summary.PossibleFiles = 0
+	b.Reset()
+	_ = Scan(&b, Text, r)
+	if !strings.Contains(b.String(), "not a complete answer") {
+		t.Errorf("a clean result with history gaps must say it is incomplete:\n%s", b.String())
+	}
+}

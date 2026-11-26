@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -26,11 +27,18 @@ type fake struct {
 	secrets   map[string][]string
 	secretErr error
 	fileReads int
+	// purged marks repositories whose old run history GitHub has deleted.
+	purged   map[string]bool
+	commits  map[string]string // repo -> default-branch commit at window end
+	branches map[string]bool   // "owner/repo@name"
+	spans    map[string][2]time.Time
+	tags     map[string]bool
 }
 
 func newFake() *fake {
 	return &fake{repos: map[string]ghapi.Repo{}, files: map[string]string{}, dirs: map[string][]string{},
-		runs: map[string][]ghapi.Run{}, logs: map[string]string{}, secrets: map[string][]string{}}
+		runs: map[string][]ghapi.Run{}, logs: map[string]string{}, secrets: map[string][]string{},
+		purged: map[string]bool{}, commits: map[string]string{}, branches: map[string]bool{}, tags: map[string]bool{}, spans: map[string][2]time.Time{}}
 }
 
 func (f *fake) GetRepo(_ context.Context, n string) (ghapi.Repo, error) {
@@ -87,6 +95,27 @@ func (f *fake) DownloadRunLogs(_ context.Context, repo string, id int64, attempt
 	zw.Close()
 	tmp.Close()
 	return tmp.Name(), nil
+}
+func (f *fake) CountRunsCreatedBefore(_ context.Context, repo string, _ time.Time) (int, error) {
+	if f.purged[repo] {
+		return 0, nil
+	}
+	return 1, nil
+}
+func (f *fake) CommitAt(_ context.Context, repo, _ string, _ time.Time) (string, error) {
+	if c, ok := f.commits[repo]; ok {
+		return c, nil
+	}
+	return "", ghapi.ErrNotFound
+}
+func (f *fake) RefKind(_ context.Context, repo, name string) (bool, bool, error) {
+	return f.branches[repo+"@"+name], f.tags[repo+"@"+name], nil
+}
+func (f *fake) RunJobsSpan(_ context.Context, repo string, id int64) (time.Time, time.Time, error) {
+	if sp, ok := f.spans[fmt.Sprintf("%s|%d", repo, id)]; ok {
+		return sp[0], sp[1], nil
+	}
+	return time.Time{}, time.Time{}, ghapi.ErrNotFound
 }
 func (f *fake) SecretNames(_ context.Context, repo string) ([]string, error) {
 	if f.secretErr != nil {
@@ -215,8 +244,10 @@ jobs:
 	if v := byID[3].Verdict; v != incident.NotAffected {
 		t.Errorf("run 3 = %s, want cleared by its log", v)
 	}
-	if r := byID[4]; !r.FromFork || r.AllSecrets || len(r.Secrets) != 0 {
-		t.Errorf("fork run must expose no secrets: %+v", r)
+	// acme/api is private: a private repository can send secrets to fork
+	// pull requests, so the fork run keeps its secrets (with a reason).
+	if r := byID[4]; !r.FromFork || !r.AllSecrets || !strings.Contains(strings.Join(r.Reasons, " "), "private repository") {
+		t.Errorf("private fork run: %+v", r)
 	}
 	if v := byID[5].Verdict; v != incident.NotAffected {
 		t.Errorf("run 5 (clean SHA pin) = %s", v)
@@ -354,5 +385,234 @@ func TestUsage(t *testing.T) {
 	}
 	if !rep.Rows[0].Direct || rep.Rows[0].Pin != "mutable" || rep.Rows[1].Direct || rep.Rows[1].Pin != "sha" {
 		t.Errorf("rows = %+v", rep.Rows)
+	}
+}
+
+func TestPurgedRunHistoryIsNotReportedClean(t *testing.T) {
+	f := newFake()
+	old := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	f.repos["o/old"] = ghapi.Repo{FullName: "o/old", DefaultBranch: "main", CreatedAt: old, Visibility: "public"}
+	f.repos["o/nowf"] = ghapi.Repo{FullName: "o/nowf", DefaultBranch: "main", CreatedAt: old}
+	f.repos["o/new"] = ghapi.Repo{FullName: "o/new", DefaultBranch: "main", CreatedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+	for _, r := range []string{"o/old", "o/nowf", "o/new"} {
+		f.purged[r] = true
+	}
+	f.commits["o/old"] = "c0ffee"
+	f.commits["o/nowf"] = "beef"
+	f.dirs["o/old|.github/workflows"] = []string{"ci.yml", "safe.yml", "notes.txt"}
+	f.files["o/old|.github/workflows/ci.yml|c0ffee"] = "jobs:\n  a:\n    steps:\n      - uses: tj-actions/changed-files@v44\n        with: { token: '${{ secrets.BOT_PAT }}' }\n"
+	f.files["o/old|.github/workflows/safe.yml|c0ffee"] = "jobs:\n  a:\n    steps:\n      - uses: tj-actions/changed-files@" + cleanSHA + "\n"
+
+	rep, err := Run(context.Background(), f, Options{Incident: tj(), Owners: []string{"o"}, Logs: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Worst() != incident.Possible || rep.Summary.PossibleFiles != 1 || rep.Summary.HistoryGaps != 2 {
+		t.Fatalf("summary = %+v (o/new was created after the window and must count as complete)", rep.Summary)
+	}
+	var oldRepo RepoResult
+	for _, r := range rep.Repos {
+		if r.Repo == "o/old" {
+			oldRepo = r
+		}
+		if r.Repo == "o/new" && !r.HistoryComplete {
+			t.Error("a repository created after the window has complete history")
+		}
+		if r.Repo == "o/nowf" && (len(r.Runs) != 0 || !strings.Contains(strings.Join(r.Notes, " "), "no workflows")) {
+			t.Errorf("o/nowf = %+v", r)
+		}
+	}
+	if len(oldRepo.Runs) != 1 {
+		t.Fatalf("o/old results = %+v", oldRepo.Runs)
+	}
+	w := oldRepo.Runs[0]
+	if w.Kind != KindWorkflowFile || w.ID != 0 || w.SHA != "c0ffee" || w.Workflow != ".github/workflows/ci.yml" || w.Secrets[0] != "BOT_PAT" {
+		t.Errorf("workflow-file result = %+v", w)
+	}
+	if len(rep.Rotation) != 1 || rep.Rotation[0].Secret != "BOT_PAT" || len(rep.Rotation[0].Runs) != 0 {
+		t.Errorf("rotation = %+v", rep.Rotation)
+	}
+}
+
+// oneRepo builds a fake with one public repository and one workflow.
+func oneRepo(wf string) *fake {
+	f := newFake()
+	f.repos["o/r"] = ghapi.Repo{FullName: "o/r", Visibility: "public"}
+	f.files["o/r|.github/workflows/a.yml|s"] = wf
+	return f
+}
+
+func scanOne(t *testing.T, f *fake, o Options) (*Report, RunResult) {
+	t.Helper()
+	if o.Incident.ID == "" {
+		o.Incident = tj()
+	}
+	o.Repos = []string{"o/r"}
+	rep, err := Run(context.Background(), f, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Repos[0].Runs) == 0 {
+		return rep, RunResult{}
+	}
+	return rep, rep.Repos[0].Runs[0]
+}
+
+func TestPublicForkRunHasNoSecrets(t *testing.T) {
+	f := oneRepo("jobs:\n  a:\n    steps:\n      - uses: tj-actions/changed-files@v1\n        env: { X: '${{ secrets.X }}' }\n")
+	r := run(1, ".github/workflows/a.yml", "s")
+	r.Event = "pull_request"
+	r.HeadRepository = &struct {
+		FullName string `json:"full_name"`
+	}{FullName: "evil/r"}
+	f.runs["o/r"] = []ghapi.Run{r}
+	_, got := scanOne(t, f, Options{})
+	if len(got.Secrets) != 0 || got.AllSecrets {
+		t.Errorf("public fork run must expose no secrets: %+v", got)
+	}
+}
+
+func TestUnreadableWorkflowIsNotClean(t *testing.T) {
+	f := oneRepo("")
+	delete(f.files, "o/r|.github/workflows/a.yml|s") // the file cannot be read
+	f.runs["o/r"] = []ghapi.Run{run(1, ".github/workflows/a.yml", "s")}
+	rep, got := scanOne(t, f, Options{Logs: true})
+	if !got.Unassessed || rep.Summary.Unassessed != 1 || !rep.Incomplete() {
+		t.Fatalf("an unreadable workflow must be kept as not assessed: %+v %+v", rep.Summary, got)
+	}
+	// Its log can still confirm it, and then every secret counts.
+	f.logs["o/r|1|1"] = "Download action repository 'tj-actions/changed-files@v1' (SHA:" + badSHA + ")\n"
+	rep, got = scanOne(t, f, Options{Logs: true})
+	if got.Verdict != incident.Confirmed || got.Unassessed || !got.AllSecrets || rep.Incomplete() {
+		t.Errorf("log-confirmed unreadable run = %+v", got)
+	}
+}
+
+func TestFailedAttemptBlocksClearing(t *testing.T) {
+	f := oneRepo("jobs:\n  a:\n    steps:\n      - uses: tj-actions/changed-files@v1\n")
+	r := run(1, ".github/workflows/a.yml", "s")
+	r.RunAttempt = 2
+	f.runs["o/r"] = []ghapi.Run{r}
+	// attempt 1 expired, attempt 2 shows a clean commit
+	f.logs["o/r|1|2"] = "Download action repository 'tj-actions/changed-files@v1' (SHA:" + cleanSHA + ")\n"
+	_, got := scanOne(t, f, Options{Logs: true})
+	if got.Verdict != incident.Possible {
+		t.Errorf("one clean attempt must not clear a run whose other attempt is unreadable: %s %+v", got.Verdict, got.Reasons)
+	}
+}
+
+func TestRerunOutsideWindowStillCounts(t *testing.T) {
+	f := oneRepo("jobs:\n  a:\n    steps:\n      - uses: tj-actions/changed-files@v1\n")
+	r := run(1, ".github/workflows/a.yml", "s")
+	r.RunAttempt = 2
+	r.RunStartedAt = inWindow.Add(10 * 24 * time.Hour) // re-run 10 days later
+	r.UpdatedAt = r.RunStartedAt
+	f.runs["o/r"] = []ghapi.Run{r}
+	_, got := scanOne(t, f, Options{})
+	if got.Verdict != incident.Possible {
+		t.Errorf("a run whose first attempt was in the window must be flagged: %+v", got)
+	}
+
+	// Created 3 hours before a short window and still running inside it.
+	rd, _ := incident.Lookup("reviewdog-action-setup-2025")
+	f2 := oneRepo("jobs:\n  a:\n    steps:\n      - uses: reviewdog/action-setup@v1\n")
+	early := run(2, ".github/workflows/a.yml", "s")
+	early.CreatedAt = rd.Start.Add(-3 * time.Hour)
+	early.RunStartedAt = early.CreatedAt
+	early.UpdatedAt = rd.Start.Add(300 * 24 * time.Hour) // GitHub moves updated_at; it must not decide
+	f2.spans["o/r|2"] = [2]time.Time{early.CreatedAt, rd.Start.Add(30 * time.Minute)}
+	// A run created before the window whose jobs all ended before it must be
+	// left out, even though its updated_at is later.
+	before := run(3, ".github/workflows/a.yml", "s")
+	before.CreatedAt = rd.Start.Add(-5 * time.Hour)
+	before.RunStartedAt = before.CreatedAt
+	before.UpdatedAt = rd.Start.Add(300 * 24 * time.Hour)
+	f2.spans["o/r|3"] = [2]time.Time{before.CreatedAt, before.CreatedAt.Add(20 * time.Minute)}
+	f2.runs["o/r"] = []ghapi.Run{early, before}
+	rep2, got := scanOne(t, f2, Options{Incident: rd})
+	if got.Verdict != incident.Possible || got.ID != 2 {
+		t.Errorf("a run active inside the window must be flagged even if created before it: %+v", got)
+	}
+	if rep2.Summary.Runs != 1 {
+		t.Errorf("the run whose jobs ended before the window must not count: %+v", rep2.Summary)
+	}
+}
+
+func TestLogOnlyConfirmationListsEveryJobsSecrets(t *testing.T) {
+	f := oneRepo("jobs:\n  a:\n    steps:\n      - uses: some/wrapper@" + cleanSHA + "\n        env: { T: '${{ secrets.NPM_TOKEN }}' }\n  b:\n    steps:\n      - run: echo ${{ secrets.OTHER }}\n")
+	f.runs["o/r"] = []ghapi.Run{run(1, ".github/workflows/a.yml", "s")}
+	f.logs["o/r|1|1"] = "Download action repository 'tj-actions/changed-files@v35' (SHA:" + badSHA + ")\n"
+	rep, got := scanOne(t, f, Options{Logs: true, Deep: true})
+	if got.Verdict != incident.Confirmed || strings.Join(got.Secrets, ",") != "NPM_TOKEN,OTHER" {
+		t.Fatalf("got %+v", got)
+	}
+	if len(rep.Rotation) != 2 {
+		t.Errorf("rotation = %+v", rep.Rotation)
+	}
+}
+
+func TestSubPathTargetMatchesRepoDownload(t *testing.T) {
+	in, err := incident.Custom("own/rep/sub", inWindow.Add(-time.Hour), inWindow.Add(time.Hour), []string{badSHA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := oneRepo("jobs:\n  a:\n    steps:\n      - uses: own/rep/sub@v1\n")
+	f.runs["o/r"] = []ghapi.Run{run(1, ".github/workflows/a.yml", "s")}
+	f.logs["o/r|1|1"] = "Download action repository 'own/rep@v1' (SHA:" + badSHA + ")\n"
+	_, got := scanOne(t, f, Options{Incident: in, Logs: true})
+	if got.Verdict != incident.Confirmed {
+		t.Errorf("sub-path target must be confirmed from the repo-level download line: %+v", got)
+	}
+}
+
+func TestBranchRefClearedWhenOnlyTagsMoved(t *testing.T) {
+	f := oneRepo("jobs:\n  a:\n    steps:\n      - uses: tj-actions/changed-files@main\n      - uses: tj-actions/changed-files@both\n")
+	f.branches["tj-actions/changed-files@main"] = true
+	f.branches["tj-actions/changed-files@both"] = true
+	f.tags["tj-actions/changed-files@both"] = true
+	f.runs["o/r"] = []ghapi.Run{run(1, ".github/workflows/a.yml", "s")}
+	_, got := scanOne(t, f, Options{})
+	if got.Verdict != incident.Possible || len(got.Jobs) != 2 {
+		t.Fatalf("got %+v", got)
+	}
+	if got.Jobs[0].Verdict != incident.NotAffected || !strings.Contains(got.Jobs[0].Reason, "branch") {
+		t.Errorf("@main (branch only) must be cleared: %+v", got.Jobs[0])
+	}
+	if got.Jobs[1].Verdict != incident.Possible {
+		t.Errorf("@both (branch AND tag) must stay possible: %+v", got.Jobs[1])
+	}
+}
+
+// flaky fails the first read of one file, then succeeds.
+type flaky struct {
+	*fake
+	failed bool
+}
+
+func (f *flaky) GetFile(ctx context.Context, repo, p, ref string) ([]byte, error) {
+	if p == "action.yml" && !f.failed {
+		f.failed = true
+		return nil, errors.New("HTTP 502")
+	}
+	return f.fake.GetFile(ctx, repo, p, ref)
+}
+
+func TestTransientErrorsAreNotCached(t *testing.T) {
+	base := oneRepo("jobs:\n  a:\n    steps:\n      - uses: x/wrap@v1\n")
+	base.files["x/wrap|action.yml|v1"] = "runs:\n  using: composite\n  steps:\n    - uses: tj-actions/changed-files@v1\n"
+	base.runs["o/r"] = []ghapi.Run{run(1, ".github/workflows/a.yml", "s"), run(2, ".github/workflows/a.yml", "s")}
+	rep, err := Run(context.Background(), &flaky{fake: base}, Options{Incident: tj(), Repos: []string{"o/r"}, Concurrency: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Summary.Possible != 1 {
+		t.Errorf("after one 502, the next run must re-read the file and find the nested action: %+v", rep.Summary)
+	}
+}
+
+func TestLowercaseGithubTokenIsNotRotated(t *testing.T) {
+	got := rotation([]RepoResult{{Repo: "o/r", Runs: []RunResult{{ID: 1, Verdict: incident.Confirmed, LeakedSecrets: []string{"github_token", "REAL"}}}}})
+	if len(got) != 1 || got[0].Secret != "REAL" {
+		t.Errorf("rotation = %+v", got)
 	}
 }

@@ -45,6 +45,18 @@ func (s *stub) DownloadRunLogs(context.Context, string, int64, int, int64) (stri
 	return "", ghapi.ErrNotFound
 }
 func (s *stub) SecretNames(context.Context, string) ([]string, error) { return nil, nil }
+func (s *stub) CountRunsCreatedBefore(context.Context, string, time.Time) (int, error) {
+	return 1, nil
+}
+func (s *stub) RefKind(context.Context, string, string) (bool, bool, error) {
+	return false, true, nil
+}
+func (s *stub) RunJobsSpan(context.Context, string, int64) (time.Time, time.Time, error) {
+	return time.Time{}, time.Time{}, ghapi.ErrNotFound
+}
+func (s *stub) CommitAt(context.Context, string, string, time.Time) (string, error) {
+	return "", ghapi.ErrNotFound
+}
 
 func testEnv(env map[string]string) (Env, *bytes.Buffer, *bytes.Buffer, *stub) {
 	var out, errb bytes.Buffer

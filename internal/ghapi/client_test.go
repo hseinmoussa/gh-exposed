@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -230,5 +231,55 @@ func TestFromFork(t *testing.T) {
 	r.Event = "pull_request_target" // runs with the base repo's secrets
 	if r.FromFork("o/r") {
 		t.Error("pull_request_target must not be treated as a fork run")
+	}
+}
+
+func TestSecondaryRateLimitIsRetried(t *testing.T) {
+	var calls atomic.Int32
+	c, slept := newTest(t, func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.WriteHeader(403)
+			w.Write([]byte(`{"message":"You have exceeded a secondary rate limit. Please wait a few minutes before you try again."}`))
+			return
+		}
+		w.Write([]byte(`{"full_name":"o/r"}`))
+	})
+	if _, err := c.GetRepo(context.Background(), "o/r"); err != nil {
+		t.Fatal(err)
+	}
+	if len(*slept) != 1 || (*slept)[0] < time.Minute {
+		t.Errorf("slept = %v, want one wait of at least a minute", *slept)
+	}
+}
+
+func TestRedactErr(t *testing.T) {
+	ue := &url.Error{Op: "Get", URL: "https://blob.example/x.zip?sv=1&sig=SECRET", Err: errors.New("connection reset")}
+	if got := redactErr(ue).Error(); strings.Contains(got, "SECRET") || !strings.Contains(got, "blob.example/x.zip") {
+		t.Errorf("redactErr(url.Error) = %q", got)
+	}
+	if got := redactErr(errors.New(`read "https://b/x?sig=SECRET": EOF`)).Error(); strings.Contains(got, "SECRET") {
+		t.Errorf("redactErr(text) = %q", got)
+	}
+	if got := RedactText("a https://b/c?sig=SECRET d"); got != "a https://b/c?REDACTED d" {
+		t.Errorf("RedactText = %q", got)
+	}
+}
+
+func TestRedirectedBodyErrorsAreRedacted(t *testing.T) {
+	blob := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1000")
+		w.Write([]byte("partial"))
+		// the handler returns early: the client sees an unexpected EOF
+	}))
+	defer blob.Close()
+	c, _ := newTest(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			t.Error("API call must carry the token")
+		}
+		http.Redirect(w, r, blob.URL+"/logs.zip?sig=SECRET", http.StatusFound)
+	})
+	_, err := c.DownloadRunLogs(context.Background(), "o/r", 1, 1, 1<<20)
+	if err == nil || strings.Contains(err.Error(), "SECRET") {
+		t.Errorf("want a redacted error, got %v", err)
 	}
 }

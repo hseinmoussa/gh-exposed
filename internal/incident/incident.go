@@ -27,6 +27,10 @@ type Target struct {
 	// AnyRef marks an action that was affected however it was pinned,
 	// because it calls a compromised action internally with a mutable ref.
 	AnyRef bool `json:"any_ref,omitempty"`
+	// MovedRefs says which kind of ref the attacker moved: "tags" when the
+	// advisory states only tags were rewritten (a reference to a branch was
+	// then not exposed), or "" when unknown (every movable ref counts).
+	MovedRefs string `json:"moved_refs,omitempty"`
 	// Start and End override the incident window for this target.
 	Start *time.Time `json:"start,omitempty"`
 	End   *time.Time `json:"end,omitempty"`
@@ -117,6 +121,9 @@ func (in Incident) Validate() error {
 			if !workflow.IsFullSHA(s) || s != strings.ToLower(s) {
 				return fmt.Errorf("incident %s: %q is not a lower-case full SHA", in.ID, s)
 			}
+		}
+		if t.MovedRefs != "" && t.MovedRefs != "tags" {
+			return fmt.Errorf("incident %s: %s moved_refs must be \"tags\" or empty", in.ID, t.Action)
 		}
 		if t.MaliciousSHAsComplete && len(t.MaliciousSHAs) == 0 {
 			return fmt.Errorf("incident %s: %s marked complete with no SHAs", in.ID, t.Action)

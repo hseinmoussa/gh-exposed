@@ -48,9 +48,11 @@ func New(baseURL, token string) *Client {
 		baseURL = "https://api.github.com"
 	}
 	return &Client{
-		BaseURL:    strings.TrimRight(baseURL, "/"),
-		Token:      token,
-		HTTP:       &http.Client{Timeout: 5 * time.Minute},
+		BaseURL: strings.TrimRight(baseURL, "/"),
+		Token:   token,
+		// The timeout covers a whole response body, and a large log archive
+		// on a slow link can take a while; 30 minutes still bounds a hang.
+		HTTP:       &http.Client{Timeout: 30 * time.Minute},
 		Sleep:      sleepCtx,
 		MaxRetries: 5,
 		MaxWait:    15 * time.Minute,
@@ -92,7 +94,7 @@ func (c *Client) do(ctx context.Context, rawURL, accept string) (*http.Response,
 		}
 		resp, err := c.HTTP.Do(req)
 		if err != nil {
-			lastErr = err
+			lastErr = redactErr(err)
 			if ctx.Err() != nil || attempt >= c.MaxRetries {
 				return nil, lastErr
 			}
@@ -102,11 +104,17 @@ func (c *Client) do(ctx context.Context, rawURL, accept string) (*http.Response,
 			continue
 		}
 		if resp.StatusCode < 300 {
+			if resp.Request != nil && resp.Request.URL != nil && resp.Request.URL.RawQuery != "" && resp.Request.URL.Host != req.URL.Host {
+				// A redirect to blob storage: the body read that follows can
+				// still fail with an error naming the signed URL, so wrap
+				// the body to redact it.
+				resp.Body = redactingBody{resp.Body}
+			}
 			return resp, nil
 		}
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		_ = resp.Body.Close()
-		wait, retry := retryAfter(resp, attempt)
+		wait, retry := retryAfter(resp, body, attempt)
 		switch {
 		case resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone:
 			return nil, fmt.Errorf("%w: GET %s", ErrNotFound, redactURL(rawURL))
@@ -130,7 +138,11 @@ func (c *Client) do(ctx context.Context, rawURL, accept string) (*http.Response,
 // GitHub signals a primary rate limit with 403/429 and
 // X-RateLimit-Remaining: 0 plus X-RateLimit-Reset, and a secondary limit
 // with Retry-After.
-func retryAfter(resp *http.Response, attempt int) (time.Duration, bool) {
+//
+// A secondary rate limit can also arrive as a plain 403 whose message says
+// so, with no Retry-After header; GitHub asks clients to wait at least a
+// minute before retrying.
+func retryAfter(resp *http.Response, body []byte, attempt int) (time.Duration, bool) {
 	if ra := resp.Header.Get("Retry-After"); ra != "" {
 		if s, err := strconv.Atoi(ra); err == nil {
 			return time.Duration(s) * time.Second, true
@@ -149,6 +161,9 @@ func retryAfter(resp *http.Response, attempt int) (time.Duration, bool) {
 		}
 		if resp.StatusCode == http.StatusTooManyRequests {
 			return backoff(attempt), true
+		}
+		if strings.Contains(strings.ToLower(apiMessage(body)), "secondary rate limit") {
+			return time.Minute + backoff(attempt), true
 		}
 		return 0, false
 	}
@@ -186,6 +201,35 @@ func redactURL(u string) string {
 		return u[:i]
 	}
 	return u
+}
+
+var queryInText = regexp.MustCompile(`\?[^\s"']*`)
+
+// RedactText removes every query string from free text. Use it on any error
+// that may have been produced after a redirect to signed blob storage.
+func RedactText(s string) string { return queryInText.ReplaceAllString(s, "?REDACTED") }
+
+// redactErr rewrites a *url.Error so its URL carries no query string, and
+// falls back to redacting the text of any other error.
+func redactErr(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		cp := *ue
+		cp.URL = redactURL(cp.URL)
+		return &cp
+	}
+	return errors.New(RedactText(err.Error()))
+}
+
+// redactingBody redacts errors returned while reading a redirected body.
+type redactingBody struct{ io.ReadCloser }
+
+func (b redactingBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil && !errors.Is(err, io.EOF) {
+		err = redactErr(err)
+	}
+	return n, err
 }
 
 func (c *Client) getJSON(ctx context.Context, path string, v any) (http.Header, error) {
@@ -229,7 +273,12 @@ type Repo struct {
 	Visibility string `json:"visibility"`
 	Archived   bool   `json:"archived"`
 	Fork       bool   `json:"fork"`
-	Owner      struct {
+	// CreatedAt and DefaultBranch let the scanner tell "no runs because the
+	// repository did not exist yet" from "no runs because GitHub no longer
+	// keeps them", and read the workflows as they were at a past time.
+	CreatedAt     time.Time `json:"created_at"`
+	DefaultBranch string    `json:"default_branch"`
+	Owner         struct {
 		Login string `json:"login"`
 	} `json:"owner"`
 }
@@ -346,6 +395,7 @@ type Run struct {
 	RunAttempt     int       `json:"run_attempt"`
 	CreatedAt      time.Time `json:"created_at"`
 	RunStartedAt   time.Time `json:"run_started_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 	HTMLURL        string    `json:"html_url"`
 	HeadRepository *struct {
 		FullName string `json:"full_name"`
@@ -473,4 +523,99 @@ func (c *Client) SecretNames(ctx context.Context, fullName string) ([]string, er
 		}
 	}
 	return out, nil
+}
+
+// CountRunsCreatedBefore returns how many runs GitHub still lists that were
+// created before t. GitHub deletes old run records (not only their logs), so
+// a run listing for an old window can be empty even though runs happened.
+// Zero here, for a repository that existed before t, means the listing does
+// not reach back to t.
+func (c *Client) CountRunsCreatedBefore(ctx context.Context, fullName string, t time.Time) (int, error) {
+	q := url.Values{}
+	q.Set("created", "<"+t.UTC().Format(time.RFC3339))
+	q.Set("per_page", "1")
+	var r struct {
+		TotalCount int `json:"total_count"`
+	}
+	_, err := c.getJSON(ctx, "/repos/"+fullName+"/actions/runs?"+q.Encode(), &r)
+	return r.TotalCount, err
+}
+
+// CommitAt returns the newest commit on branch at or before t, or
+// ErrNotFound when the branch has no commit that old.
+func (c *Client) CommitAt(ctx context.Context, fullName, branch string, t time.Time) (string, error) {
+	q := url.Values{}
+	q.Set("sha", branch)
+	q.Set("until", t.UTC().Format(time.RFC3339))
+	q.Set("per_page", "1")
+	var commits []struct {
+		SHA string `json:"sha"`
+	}
+	if _, err := c.getJSON(ctx, "/repos/"+fullName+"/commits?"+q.Encode(), &commits); err != nil {
+		return "", err
+	}
+	if len(commits) == 0 {
+		return "", fmt.Errorf("%w: no commit on %s before %s", ErrNotFound, branch, t.Format(time.RFC3339))
+	}
+	return commits[0].SHA, nil
+}
+
+// RefKind reports whether name is a branch and/or a tag in a repository. A
+// name can be both; GitHub then has to pick one, so callers must not treat
+// such a ref as a branch.
+func (c *Client) RefKind(ctx context.Context, fullName, name string) (isBranch, isTag bool, err error) {
+	check := func(kind string) (bool, error) {
+		var ref struct {
+			Ref string `json:"ref"`
+		}
+		_, err := c.getJSON(ctx, "/repos/"+fullName+"/git/ref/"+kind+"/"+escapePath(name), &ref)
+		if errors.Is(err, ErrNotFound) {
+			return false, nil
+		}
+		// git/ref returns an exact match only, so a 200 means this name.
+		return err == nil, err
+	}
+	if isBranch, err = check("heads"); err != nil {
+		return false, false, err
+	}
+	isTag, err = check("tags")
+	return isBranch, isTag, err
+}
+
+// RunJobsSpan returns when the earliest job of any attempt of a run started
+// and when the latest one finished (a job still running counts as now). It
+// is the reliable answer to "when did this run execute": the run's own
+// updated_at moves long after it finished.
+func (c *Client) RunJobsSpan(ctx context.Context, fullName string, runID int64) (time.Time, time.Time, error) {
+	var first, last time.Time
+	seen := 0
+	err := c.paginate(ctx, fmt.Sprintf("/repos/%s/actions/runs/%d/jobs?filter=all&per_page=100", fullName, runID), func(page json.RawMessage) error {
+		var p struct {
+			Jobs []struct {
+				StartedAt   time.Time  `json:"started_at"`
+				CompletedAt *time.Time `json:"completed_at"`
+			} `json:"jobs"`
+		}
+		if err := json.Unmarshal(page, &p); err != nil {
+			return err
+		}
+		for _, j := range p.Jobs {
+			seen++
+			end := time.Now().UTC()
+			if j.CompletedAt != nil && !j.CompletedAt.IsZero() {
+				end = *j.CompletedAt
+			}
+			if !j.StartedAt.IsZero() && (first.IsZero() || j.StartedAt.Before(first)) {
+				first = j.StartedAt
+			}
+			if end.After(last) {
+				last = end
+			}
+		}
+		return nil
+	})
+	if err == nil && seen == 0 {
+		err = fmt.Errorf("%w: run %d has no jobs", ErrNotFound, runID)
+	}
+	return first, last, err
 }

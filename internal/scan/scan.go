@@ -44,7 +44,11 @@ type JobHit struct {
 
 // RunResult is one run that reached a compromised action.
 type RunResult struct {
-	ID        int64            `json:"id"`
+	// Kind is KindRun for a real workflow run, or KindWorkflowFile for a
+	// workflow file judged without a run (the run history is gone); a
+	// workflow-file result has no ID, event or start time.
+	Kind      string           `json:"kind"`
+	ID        int64            `json:"id,omitempty"`
 	Attempts  int              `json:"attempts"`
 	URL       string           `json:"url"`
 	Workflow  string           `json:"workflow"`
@@ -62,16 +66,28 @@ type RunResult struct {
 	// LeakedSecrets: names found printed (encoded) in this run's log.
 	LeakedSecrets []string `json:"leaked_secrets,omitempty"`
 	FromFork      bool     `json:"from_fork"`
-	LogStatus     string   `json:"log_status"`
-	Evidence      []string `json:"evidence,omitempty"`
+	// Unassessed: the workflow file could not be read, so the run could be
+	// neither cleared nor flagged from it.
+	Unassessed bool     `json:"unassessed,omitempty"`
+	LogStatus  string   `json:"log_status"`
+	Evidence   []string `json:"evidence,omitempty"`
 }
+
+// Result kinds.
+const (
+	KindRun          = "run"
+	KindWorkflowFile = "workflow_file"
+)
 
 // RepoResult is one scanned repository.
 type RepoResult struct {
-	Repo         string      `json:"repo"`
-	Visibility   string      `json:"visibility"`
-	RunsInWindow int         `json:"runs_in_window"`
-	Runs         []RunResult `json:"runs,omitempty"`
+	Repo         string `json:"repo"`
+	Visibility   string `json:"visibility"`
+	RunsInWindow int    `json:"runs_in_window"`
+	// HistoryComplete is false when GitHub no longer lists runs from before
+	// the window: an empty run list then proves nothing.
+	HistoryComplete bool        `json:"history_complete"`
+	Runs            []RunResult `json:"runs,omitempty"`
 	// RepoSecrets is filled when a job read all secrets and the token could
 	// list them.
 	RepoSecrets []string `json:"repo_secrets,omitempty"`
@@ -96,6 +112,11 @@ type Summary struct {
 	Confirmed int `json:"runs_confirmed"`
 	Possible  int `json:"runs_possible"`
 	Cleared   int `json:"runs_used_action_not_exposed"`
+	// HistoryGaps counts repositories whose run history does not reach the
+	// window; PossibleFiles counts workflow files flagged in them.
+	HistoryGaps   int `json:"repos_without_run_history"`
+	Unassessed    int `json:"runs_not_assessed"`
+	PossibleFiles int `json:"workflow_files_possible"`
 }
 
 // Report is the whole result.
@@ -109,12 +130,18 @@ type Report struct {
 	Notes     []string          `json:"notes,omitempty"`
 }
 
+// Incomplete reports whether part of the scan failed, so "nothing found"
+// must not be read as "nothing happened".
+func (r *Report) Incomplete() bool {
+	return r.Summary.RepoErrs > 0 || r.Summary.Unassessed > 0
+}
+
 // Worst returns the most severe verdict in the report.
 func (r *Report) Worst() incident.Verdict {
 	switch {
 	case r.Summary.Confirmed > 0:
 		return incident.Confirmed
-	case r.Summary.Possible > 0:
+	case r.Summary.Possible > 0 || r.Summary.PossibleFiles > 0:
 		return incident.Possible
 	}
 	return incident.NotAffected
@@ -164,7 +191,17 @@ func Run(ctx context.Context, src Source, o Options) (*Report, error) {
 		if r.Error != "" {
 			rep.Summary.RepoErrs++
 		}
+		if !r.HistoryComplete && r.Error == "" {
+			rep.Summary.HistoryGaps++
+		}
 		for _, run := range r.Runs {
+			if run.Kind == KindWorkflowFile {
+				rep.Summary.PossibleFiles++
+				continue
+			}
+			if run.Unassessed {
+				rep.Summary.Unassessed++
+			}
 			switch run.Verdict {
 			case incident.Confirmed:
 				rep.Summary.Confirmed++
@@ -240,12 +277,59 @@ func scanRepo(ctx context.Context, src Source, res *resolver, o Options, repo gh
 			end = e
 		}
 	}
-	runs, err := src.ListRuns(ctx, repo.FullName, start, end)
+	// A run created shortly before the window can still be executing inside
+	// it (a long job, a job waiting on `needs:`), so the listing starts a day
+	// early and each run is then kept only if its active time overlaps.
+	listed, err := src.ListRuns(ctx, repo.FullName, start.Add(-runLead), end)
 	if err != nil {
-		out.Error = "list runs: " + err.Error()
+		out.Error = "list runs: " + ghapi.RedactText(err.Error())
 		return out
 	}
+	var runs []ghapi.Run
+	spans := map[int64]activeSpan{}
+	spanUnknown := 0
+	for _, r := range listed {
+		from, to := runActive(r)
+		if to.Before(start) && r.CreatedAt.Before(start) {
+			// Created before the window: did any job still run inside it?
+			// Only the jobs know; the run's updated_at cannot be trusted.
+			_, last, err := src.RunJobsSpan(ctx, repo.FullName, r.ID)
+			switch {
+			case err != nil:
+				spanUnknown++
+				to = r.UpdatedAt // cautious: include it if it might overlap
+			case last.After(to):
+				to = last
+			}
+		}
+		if !from.After(end) && !to.Before(start) {
+			runs = append(runs, r)
+			spans[r.ID] = activeSpan{from, to}
+		}
+	}
+	if spanUnknown > 0 {
+		out.Notes = append(out.Notes, fmt.Sprintf("%d run(s) created before the window had no readable job times; they were included if they might overlap it", spanUnknown))
+	}
 	out.RunsInWindow = len(runs)
+	out.HistoryComplete = true
+	// A repository created after the window started cannot have older runs,
+	// so its listing is complete by definition. Otherwise ask whether GitHub
+	// still lists ANY run from before the window.
+	if repo.CreatedAt.IsZero() || repo.CreatedAt.Before(start) {
+		n, err := src.CountRunsCreatedBefore(ctx, repo.FullName, start)
+		switch {
+		case err != nil:
+			out.Notes = append(out.Notes, "could not check how far back the run history goes ("+shortErr(err)+"); an empty result may be incomplete")
+		case n == 0:
+			out.HistoryComplete = false
+			out.Notes = append(out.Notes, "GitHub lists no run of this repository from before the window, so runs inside it may have been deleted; its workflows from the window were checked instead")
+			files, note := historyFallback(ctx, src, res, in, repo, end)
+			out.Runs = append(out.Runs, files...)
+			if note != "" {
+				out.Notes = append(out.Notes, note)
+			}
+		}
+	}
 
 	// Runs are independent and dominated by log downloads, so they are
 	// scanned in parallel. Results keep the listing order (newest first).
@@ -261,6 +345,7 @@ func scanRepo(ctx context.Context, src Source, res *resolver, o Options, repo gh
 			continue // the run never executed a step
 		}
 		wg.Add(1)
+		span := spans[run.ID]
 		go func(i int, run ghapi.Run) {
 			defer wg.Done()
 			sem <- struct{}{}
@@ -268,7 +353,7 @@ func scanRepo(ctx context.Context, src Source, res *resolver, o Options, repo gh
 			if ctx.Err() != nil {
 				return
 			}
-			rr, keep := scanRun(ctx, src, res, o, repo.FullName, run)
+			rr, keep := scanRun(ctx, src, res, o, repo, run, span)
 			slots[i] = slot{rr, keep}
 		}(i, run)
 	}
@@ -310,6 +395,32 @@ func shortErr(err error) string {
 	return err.Error()
 }
 
+// runLead is how long before the window runs are listed: a run created then
+// may still have been executing when the window opened.
+const runLead = 24 * time.Hour
+
+// runActive returns the span a run is known to have been active from its own
+// timestamps: creation (when attempt 1 began) to the latest attempt's start.
+// run_started_at alone is not enough, because a re-run resets it and would
+// hide a first attempt that ran inside the window. updated_at is NOT used:
+// GitHub moves it months after a run finished. A run created before the
+// window has its real end read from its jobs (see scanRepo).
+func runActive(r ghapi.Run) (time.Time, time.Time) {
+	var from, to time.Time
+	for _, t := range []time.Time{r.RunStartedAt, r.CreatedAt} {
+		if t.IsZero() {
+			continue
+		}
+		if from.IsZero() || t.Before(from) {
+			from = t
+		}
+		if t.After(to) {
+			to = t
+		}
+	}
+	return from, to
+}
+
 func runStart(r ghapi.Run) time.Time {
 	if !r.RunStartedAt.IsZero() {
 		return r.RunStartedAt
@@ -319,89 +430,215 @@ func runStart(r ghapi.Run) time.Time {
 
 // scanRun assesses one run. keep is false for a run that never reached a
 // compromised action (it is counted, not listed).
-func scanRun(ctx context.Context, src Source, res *resolver, o Options, repo string, run ghapi.Run) (RunResult, bool) {
+// span is when the run was active, as worked out by scanRepo.
+func scanRun(ctx context.Context, src Source, res *resolver, o Options, repo ghapi.Repo, run ghapi.Run, span activeSpan) (RunResult, bool) {
 	in := o.Incident
-	started := runStart(run)
 	rr := RunResult{
-		ID: run.ID, Attempts: max(run.RunAttempt, 1), URL: run.HTMLURL, Workflow: run.Path,
-		Event: run.Event, Branch: run.HeadBranch, SHA: run.HeadSHA, StartedAt: started,
-		FromFork: run.FromFork(repo), LogStatus: "not downloaded",
+		Kind: KindRun, ID: run.ID, Attempts: max(run.RunAttempt, 1), URL: run.HTMLURL, Workflow: run.Path,
+		Event: run.Event, Branch: run.HeadBranch, SHA: run.HeadSHA, StartedAt: runStart(run),
+		FromFork: run.FromFork(repo.FullName), LogStatus: "not downloaded",
 	}
 
 	// 1. Static assessment from the workflow file at the commit that ran.
-	secrets := map[string]bool{}
-	if strings.HasPrefix(run.Path, ".github/workflows/") {
-		data, err := res.get(ctx, repo, run.Path, run.HeadSHA)
-		var wf *workflow.File
-		if err == nil {
-			wf, err = workflow.ParseWorkflow(data)
+	var st static
+	switch {
+	case strings.HasPrefix(run.Path, ".github/workflows/"):
+		st = assessWorkflow(ctx, res, in, repo.FullName, run.Path, run.HeadSHA, &span)
+		rr.Jobs, rr.Verdict = st.jobs, st.verdict
+		if st.err != "" {
+			// Not knowing is not the same as clean: keep the run, try its
+			// logs, and count it so the result is reported as incomplete.
+			rr.Unassessed = true
+			rr.Reasons = append(rr.Reasons, st.err)
 		}
-		if err != nil {
-			rr.Reasons = append(rr.Reasons, "workflow file could not be read at "+short(run.HeadSHA)+": "+shortErr(err))
-		}
-		if wf != nil {
-			for _, job := range wf.Jobs {
-				found := res.expand(ctx, repo, run.HeadSHA, job.Uses, run.Path+"@"+short(run.HeadSHA), nil, 0, map[string]bool{})
-				jobHit := false
-				for _, f := range found {
-					for _, t := range in.Targets {
-						s, e := in.Window(t)
-						if started.Before(s) || started.After(e) {
-							continue
-						}
-						v, why := t.Assess(f.Ref)
-						if why == "" {
-							continue
-						}
-						rr.Jobs = append(rr.Jobs, JobHit{Job: job.ID, Action: f.Ref.Raw, Verdict: v, Reason: why, Chain: f.Chain})
-						if v > rr.Verdict {
-							rr.Verdict = v
-						}
-						if v != incident.NotAffected {
-							jobHit = true
-						}
-					}
-				}
-				if jobHit {
-					for _, s := range job.Secrets {
-						secrets[s] = true
-					}
-					if job.AllSecrets {
-						rr.AllSecrets = true
-					}
-				}
-			}
-		}
-	} else if run.Path != "" {
+	case run.Path != "":
 		rr.Reasons = append(rr.Reasons, "run of "+run.Path+" has no workflow file in the repository (a GitHub-managed workflow); only its logs can show what ran")
 	}
 	staticHit := len(rr.Jobs) > 0
 
 	// 2. Log evidence.
-	wantLogs := o.Logs && (rr.Verdict == incident.Possible || o.Deep)
+	wantLogs := o.Logs && (rr.Verdict == incident.Possible || o.Deep || rr.Unassessed)
 	if wantLogs {
-		ev, status := fetchEvidence(ctx, src, o, repo, run)
+		ev, status := fetchEvidence(ctx, src, o, repo.FullName, run)
 		rr.LogStatus = status
 		if ev != nil {
 			applyEvidence(&rr, in, ev)
 		}
 	}
-	if !staticHit && rr.Verdict == incident.NotAffected && len(rr.Evidence) == 0 {
+	if rr.Verdict == incident.Confirmed {
+		rr.Unassessed = false
+	}
+	if !staticHit && !rr.Unassessed && rr.Verdict == incident.NotAffected && len(rr.Evidence) == 0 {
 		return rr, false
 	}
 
 	if rr.Verdict == incident.Possible {
 		rr.Reasons = append([]string{possibleSummary(rr)}, rr.Reasons...)
 	}
+
+	// 3. Secrets the exposed code could read.
+	secrets, all := st.secrets, st.allSecrets
+	if rr.Verdict == incident.Confirmed && !st.anyJobHit {
+		// Only the log proved it, and the log does not map back to a job id,
+		// so every job's secrets count. With no readable workflow at all,
+		// every secret does.
+		if st.err != "" || st.everySecret == nil {
+			all = true
+		} else {
+			secrets, all = st.everySecret, st.everyAll
+		}
+		rr.Reasons = append(rr.Reasons, "the log does not say which job ran the compromised code, so the secrets of every job in the workflow are listed")
+	}
 	for s := range secrets {
 		rr.Secrets = append(rr.Secrets, s)
 	}
 	sort.Strings(rr.Secrets)
+	rr.AllSecrets = all
 	if rr.FromFork {
-		rr.Reasons = append(rr.Reasons, "triggered by a pull request from a fork: GitHub gave it no repository secrets, only a read-only GITHUB_TOKEN")
-		rr.Secrets, rr.AllSecrets = nil, false
+		if visibility(repo) == "public" {
+			rr.Reasons = append(rr.Reasons, "triggered by a pull request from a fork: GitHub gave it no repository secrets, only a read-only GITHUB_TOKEN")
+			rr.Secrets, rr.AllSecrets = nil, false
+		} else {
+			rr.Reasons = append(rr.Reasons, "triggered by a pull request from a fork; a private repository can be set to send secrets to fork pull requests, so its secrets are still listed (check the repository's Actions settings)")
+		}
 	}
 	return rr, true
+}
+
+// activeSpan is when a run may have executed steps.
+type activeSpan struct{ from, to time.Time }
+
+// static is what one workflow file shows, before any log is read.
+type static struct {
+	jobs       []JobHit
+	verdict    incident.Verdict
+	secrets    map[string]bool // secrets of the jobs that reached the action
+	allSecrets bool
+	anyJobHit  bool
+	// everySecret / everyAll cover every job in the file, for a run that
+	// only its log ties to the compromise.
+	everySecret map[string]bool
+	everyAll    bool
+	err         string
+}
+
+// assessWorkflow judges one workflow file at one commit. active, when not
+// nil, limits each target to runs active during its window; nil means the
+// time is unknown (no run history) and every target applies.
+func assessWorkflow(ctx context.Context, res *resolver, in incident.Incident, repo, path, sha string, active *activeSpan) static {
+	st := static{secrets: map[string]bool{}}
+	data, err := res.get(ctx, repo, path, sha)
+	var wf *workflow.File
+	if err == nil {
+		wf, err = workflow.ParseWorkflow(data)
+	}
+	if err != nil {
+		st.err = "workflow file could not be read at " + short(sha) + ": " + shortErr(err)
+		return st
+	}
+	st.everySecret = map[string]bool{}
+	for _, job := range wf.Jobs {
+		for _, name := range job.Secrets {
+			st.everySecret[name] = true
+		}
+		if job.AllSecrets {
+			st.everyAll = true
+		}
+		found := res.expand(ctx, repo, sha, job.Uses, path+"@"+short(sha), nil, 0, map[string]bool{})
+		jobHit := false
+		for _, f := range found {
+			for _, t := range in.Targets {
+				if active != nil {
+					s, e := in.Window(t)
+					if active.from.After(e) || active.to.Before(s) {
+						continue
+					}
+				}
+				v, why := t.Assess(f.Ref)
+				if why == "" {
+					continue
+				}
+				if v == incident.Possible && t.MovedRefs == "tags" && !t.AnyRef && f.Ref.Pin == workflow.PinMutable &&
+					res.onlyBranch(ctx, f.Ref.Owner+"/"+f.Ref.Repo, f.Ref.Version) {
+					v, why = incident.NotAffected, fmt.Sprintf("%q is a branch, and the advisory says only tags were moved", f.Ref.Version)
+				}
+				st.jobs = append(st.jobs, JobHit{Job: job.ID, Action: f.Ref.Raw, Verdict: v, Reason: why, Chain: f.Chain})
+				if v > st.verdict {
+					st.verdict = v
+				}
+				if v != incident.NotAffected {
+					jobHit = true
+				}
+			}
+		}
+		if jobHit {
+			st.anyJobHit = true
+			for _, name := range job.Secrets {
+				st.secrets[name] = true
+			}
+			if job.AllSecrets {
+				st.allSecrets = true
+			}
+		}
+	}
+	return st
+}
+
+// historyFallback handles a repository whose run history does not reach
+// back to the window. It reads every workflow on the default branch as it was
+// at the end of the window and reports each one that used a compromised
+// action with a movable ref as possible: if it ran in the window, it ran the
+// malicious code, and nothing left on GitHub can say whether it ran.
+func historyFallback(ctx context.Context, src Source, res *resolver, in incident.Incident, repo ghapi.Repo, end time.Time) ([]RunResult, string) {
+	if repo.DefaultBranch == "" {
+		return nil, "the default branch is unknown, so the workflows from the window could not be read"
+	}
+	sha, err := src.CommitAt(ctx, repo.FullName, repo.DefaultBranch, end)
+	if err != nil {
+		return nil, "could not find the " + repo.DefaultBranch + " commit at the end of the window: " + shortErr(err)
+	}
+	files, err := src.ListDir(ctx, repo.FullName, ".github/workflows", sha)
+	if errors.Is(err, ghapi.ErrNotFound) {
+		return nil, "the repository had no workflows on " + repo.DefaultBranch + " at the end of the window (commit " + short(sha) + ")"
+	}
+	if err != nil {
+		return nil, "could not list the workflows at " + short(sha) + ": " + shortErr(err)
+	}
+	var out []RunResult
+	cleared := 0
+	for _, name := range files {
+		if !strings.HasSuffix(name, ".yml") && !strings.HasSuffix(name, ".yaml") {
+			continue
+		}
+		p := ".github/workflows/" + name
+		st := assessWorkflow(ctx, res, in, repo.FullName, p, sha, nil)
+		if st.verdict != incident.Possible {
+			if len(st.jobs) > 0 {
+				cleared++
+			}
+			continue
+		}
+		rr := RunResult{
+			Kind: KindWorkflowFile, Workflow: p, SHA: sha, Branch: repo.DefaultBranch,
+			URL:     "https://github.com/" + repo.FullName + "/blob/" + sha + "/" + p,
+			Verdict: incident.Possible, Jobs: st.jobs, AllSecrets: st.allSecrets,
+			LogStatus: "no run history",
+			Reasons: []string{"GitHub no longer lists this repository's runs from the window. This workflow, as it was on " +
+				repo.DefaultBranch + " at the end of the window, used the action with a movable ref: if it ran in the window, it ran the compromised code"},
+		}
+		for name := range st.secrets {
+			rr.Secrets = append(rr.Secrets, name)
+		}
+		sort.Strings(rr.Secrets)
+		out = append(out, rr)
+	}
+	switch {
+	case len(out) == 0 && cleared == 0:
+		return nil, "none of its workflows on " + repo.DefaultBranch + " at the end of the window (commit " + short(sha) + ") used a compromised action"
+	case cleared > 0:
+		return out, fmt.Sprintf("%d workflow(s) at commit %s used a compromised action in a way that was not exposed (for example pinned to a commit SHA)", cleared, short(sha))
+	}
+	return out, ""
 }
 
 func possibleSummary(rr RunResult) string {
@@ -423,16 +660,21 @@ func fetchEvidence(ctx context.Context, src Source, o Options, repo string, run 
 		p, err := src.DownloadRunLogs(ctx, repo, run.ID, a, o.MaxLogBytes)
 		if errors.Is(err, ghapi.ErrNotFound) {
 			gone++
+			all.Skipped = append(all.Skipped, fmt.Sprintf("attempt %d: logs expired", a))
 			continue
 		}
 		if err != nil {
-			errs = append(errs, shortErr(err))
+			msg := ghapi.RedactText(shortErr(err))
+			errs = append(errs, msg)
+			all.Skipped = append(all.Skipped, fmt.Sprintf("attempt %d: %s", a, msg))
 			continue
 		}
 		ev, err := logscan.ScanZip(p, o.Incident.Indicators)
 		_ = os.Remove(p)
 		if err != nil {
-			errs = append(errs, err.Error())
+			msg := ghapi.RedactText(err.Error())
+			errs = append(errs, msg)
+			all.Skipped = append(all.Skipped, fmt.Sprintf("attempt %d: %s", a, msg))
 			continue
 		}
 		got++
@@ -465,7 +707,9 @@ func applyEvidence(rr *RunResult, in incident.Incident, ev *logscan.Evidence) {
 			continue
 		}
 		for _, t := range in.Targets {
-			if !ref.Matches(t.Action) {
+			// The runner logs the repository it downloaded ("owner/repo@ref"),
+			// never the sub-path, so compare repositories.
+			if ref.RepoSlug() != targetRepo(t.Action) {
 				continue
 			}
 			matchedDownload = true
@@ -503,6 +747,15 @@ func applyEvidence(rr *RunResult, in incident.Incident, ev *logscan.Evidence) {
 	rr.Evidence = dedupe(rr.Evidence)
 }
 
+// targetRepo returns the lower-case "owner/repo" of a target action.
+func targetRepo(action string) string {
+	parts := strings.Split(strings.Trim(strings.ToLower(action), "/"), "/")
+	if len(parts) < 2 {
+		return ""
+	}
+	return parts[0] + "/" + parts[1]
+}
+
 func dedupe(in []string) []string {
 	seen := map[string]bool{}
 	var out []string
@@ -538,7 +791,7 @@ func rotation(repos []RepoResult) []Rotation {
 	rank := map[string]int{"critical": 3, "high": 2, "medium": 1}
 	items := map[key]*Rotation{}
 	add := func(repo, secret, prio, why string, run int64) {
-		if secret == githubToken {
+		if strings.EqualFold(secret, githubToken) {
 			return
 		}
 		k := key{repo, secret}
@@ -549,6 +802,9 @@ func rotation(repos []RepoResult) []Rotation {
 		}
 		if rank[prio] > rank[it.Priority] {
 			it.Priority, it.Why = prio, why
+		}
+		if run == 0 {
+			return // a workflow-file result has no run to point at
 		}
 		for _, r := range it.Runs {
 			if r == run {
@@ -570,6 +826,9 @@ func rotation(repos []RepoResult) []Rotation {
 				}
 			}
 			prio, why := "medium", "readable by a run that possibly executed the compromised action"
+			if run.Kind == KindWorkflowFile {
+				why = "readable by a workflow that used the compromised action; its runs from the window are no longer listed"
+			}
 			if run.Verdict == incident.Confirmed {
 				prio, why = "high", "readable by a run confirmed to have executed the compromised action"
 				if repo.Visibility == "public" && len(run.LeakedSecrets) > 0 {

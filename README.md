@@ -60,7 +60,8 @@ Tools like [zizmor](https://github.com/zizmorcore/zizmor), [pinact](https://gith
 - **Finds dumped secrets.** It decodes the double-base64 memory dumps that the tj-actions and reviewdog payloads printed into logs and reports the secret **names** inside. It never prints, stores or returns secret values.
 - **Builds the rotation list.** It names the secrets each affected job could actually read (by name, plus `secrets: inherit`, `toJSON(secrets)` and dynamic `secrets[...]`), skips fork pull requests (no secrets), skips `GITHUB_TOKEN` (revoked when the job ends), and ranks secrets: **critical** (value is in a log, or in a public log), **high** (confirmed run), **medium** (possible run).
 - **Knows the real incidents**, each sourced from its GitHub advisory: windows, malicious SHAs, refs that were never moved, and indicators of compromise. For a new incident, pass `--action`, `--since` and `--until` yourself.
-- **Works in CI**: text, Markdown or JSON output, and exit codes (`0` clean, `2` possible, `3` confirmed).
+- **Never calls an incomplete scan clean.** GitHub deletes old run records, so for an older incident an empty run list proves nothing: gh-exposed detects that and checks the workflow files as they were at the end of the window instead. A repository or run it could not read is reported, and the exit code is `1`, not `0`.
+- **Works in CI**: text, Markdown or JSON output, and exit codes (`0` clean, `2` possible, `3` confirmed, `1` error or incomplete).
 - **Small and auditable**: one Go binary, one dependency (`gopkg.in/yaml.v3`), read-only API calls, and signed build provenance on every release.
 
 ## Install
@@ -131,7 +132,9 @@ Missing one? Adding an incident is a single JSON entry: see [CONTRIBUTING.md](CO
 |---|---|
 | **confirmed** | The run's log shows the malicious commit downloaded, an indicator of compromise, or a dumped secret. |
 | **possible** | The workflow used the action with a movable ref (a tag or branch) inside the window, and no log evidence settles it (for example, the logs expired). Treat its secrets as exposed. |
-| **not exposed** | The action was pinned to a full commit SHA that is not malicious, used a ref the advisory says was never moved, or the log shows a clean commit and the advisory lists every malicious one. |
+| **not exposed** | The action was pinned to a full commit SHA that is not malicious; or used a ref the advisory says was never moved; or used a branch when the advisory says only tags were moved; or the log shows a clean commit and the advisory lists every malicious one. |
+
+A run counts as "in the window" if any attempt of it was active during the window: a re-run days later does not hide a first attempt that ran inside it, and a run created before the window whose jobs were still running inside it is included.
 
 ## Flags
 
@@ -153,14 +156,16 @@ gh exposed scan
 
 The token comes from `GH_TOKEN`, then `GITHUB_TOKEN`, then `gh auth token`. Every call is a read. A fine-grained token needs these repository permissions:
 
-- **Metadata: read**, **Contents: read** and **Actions: read**: required.
+- **Metadata: read**, **Contents: read** and **Actions: read**: required (Actions covers runs, jobs and logs).
 - **Secrets: read**: optional. Only used to list secret names when a job read every secret.
 
 ## Limits
 
-- **Logs expire.** GitHub keeps run logs for 90 days by default and at most 400. Older runs can only be judged from their workflow files, so they stay **possible**.
+- **Logs expire, and so do runs.** GitHub keeps run logs for 90 days by default and at most 400, and in testing it no longer listed runs from early 2025 at all. Runs without logs can only be judged from their workflow files, so they stay **possible**. When the run history does not reach the window, gh-exposed reads the workflows on the default branch as they were at the end of the window and flags each one that used the action; it cannot tell how many times, or whether, such a workflow ran in the window, and it does not see other branches.
 - **Tags have no history.** A composite action reached through a movable ref is expanded from that ref's content *today*. A nested call the attacker added and later removed is invisible in the files. `--deep` reads every run's log to catch it while logs exist.
 - **Pull requests** run the workflow from the merge commit; gh-exposed reads it at the pull request's head commit, which almost always holds the same workflow.
+- **Local actions inside another repository's reusable workflow** are read from that workflow's repository; at run time GitHub may resolve them against the caller's checkout instead.
+- **More than 1,000 runs within two seconds** in one repository cannot be listed completely (GitHub caps a filtered listing at 1,000 results).
 - **Environment secrets** are not listed by name; a job that reads all secrets is reported as "every secret this repository can use".
 - **Runs, not artifacts.** It does not check binaries, images or packages a compromised run produced.
 
