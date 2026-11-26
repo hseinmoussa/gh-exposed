@@ -430,7 +430,7 @@ func fetchEvidence(ctx context.Context, src Source, o Options, repo string, run 
 			continue
 		}
 		ev, err := logscan.ScanZip(p, o.Incident.Indicators)
-		os.Remove(p)
+		_ = os.Remove(p)
 		if err != nil {
 			errs = append(errs, err.Error())
 			continue
@@ -524,7 +524,7 @@ func short(s string) string {
 }
 
 // githubToken is never worth rotating: GitHub revokes it when the job ends.
-const githubToken = "GITHUB_TOKEN"
+const githubToken = "GITHUB_TOKEN" //nolint:gosec // a secret NAME, not a credential
 
 // rotation turns affected runs into an ordered list of secrets to rotate.
 //

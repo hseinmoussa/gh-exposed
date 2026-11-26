@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -29,8 +30,31 @@ const (
 	ExitUsage     = 64
 )
 
-// Version is set at build time with -ldflags.
-var Version = "dev"
+// Version can be set at build time with
+// -ldflags "-X github.com/hseinmoussa/gh-exposed/internal/cli.Version=v1.2.3".
+// When it is not, version() falls back to the module version (set by
+// `go install ...@vX`) and then to the VCS revision the binary was built from
+// (set by `gh extension install`, which builds from a tag).
+var Version = ""
+
+func version() string {
+	if Version != "" {
+		return Version
+	}
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "dev"
+	}
+	if v := info.Main.Version; v != "" && v != "(devel)" {
+		return v
+	}
+	for _, s := range info.Settings {
+		if s.Key == "vcs.revision" && len(s.Value) >= 12 {
+			return "dev-" + s.Value[:12]
+		}
+	}
+	return "dev"
+}
 
 // Env is everything the CLI touches outside itself, so tests can swap it.
 type Env struct {
@@ -90,7 +114,7 @@ func Main(ctx context.Context, args []string, env Env) int {
 	case "incidents":
 		return cmdIncidents(args[1:], env)
 	case "version", "--version", "-v":
-		fmt.Fprintln(env.Stdout, "gh-exposed", Version)
+		fmt.Fprintln(env.Stdout, "gh-exposed", version())
 		return ExitOK
 	case "help", "-h", "--help":
 		fmt.Fprint(env.Stdout, usage)

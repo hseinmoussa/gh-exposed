@@ -68,7 +68,7 @@ func ScanZip(path string, indicators []string) (*Evidence, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open log archive: %w", err)
 	}
-	defer zr.Close()
+	defer func() { _ = zr.Close() }()
 	ev := &Evidence{}
 	leaked := map[string]bool{}
 	for _, f := range zr.File {
@@ -81,7 +81,7 @@ func ScanZip(path string, indicators []string) (*Evidence, error) {
 			continue
 		}
 		err = scanFile(f.Name, rc, indicators, ev, leaked)
-		rc.Close()
+		_ = rc.Close() // read-only: a close error cannot lose data
 		if err != nil {
 			ev.Skipped = append(ev.Skipped, f.Name+": "+err.Error())
 		}
