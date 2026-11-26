@@ -133,3 +133,17 @@ func TestCustom(t *testing.T) {
 		t.Error("want error for short SHA")
 	}
 }
+
+func TestVerdictTextRoundTrip(t *testing.T) {
+	for _, v := range []Verdict{NotAffected, Possible, Confirmed} {
+		b, _ := v.MarshalText()
+		var got Verdict
+		if err := got.UnmarshalText(b); err != nil || got != v {
+			t.Errorf("round trip %s: %v %v", v, got, err)
+		}
+	}
+	var v Verdict
+	if err := v.UnmarshalText([]byte("maybe")); err == nil {
+		t.Error("want error for unknown verdict")
+	}
+}

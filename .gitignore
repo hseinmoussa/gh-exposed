@@ -1,0 +1,4 @@
+/gh-exposed
+/dist/
+*.zip
+/coverage.out

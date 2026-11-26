@@ -168,6 +168,22 @@ func (v Verdict) String() string {
 // MarshalText makes a Verdict render as its name in JSON.
 func (v Verdict) MarshalText() ([]byte, error) { return []byte(v.String()), nil }
 
+// UnmarshalText reads a Verdict back from its name, so JSON reports can be
+// consumed by other Go programs (and by this tool's tests).
+func (v *Verdict) UnmarshalText(b []byte) error {
+	switch string(b) {
+	case "confirmed":
+		*v = Confirmed
+	case "possible":
+		*v = Possible
+	case "not_affected":
+		*v = NotAffected
+	default:
+		return fmt.Errorf("unknown verdict %q", b)
+	}
+	return nil
+}
+
 // Assess judges one reference against one target, from the workflow file
 // alone. It never returns Confirmed: only log evidence can confirm.
 // The returned reason is a sentence for the report.
