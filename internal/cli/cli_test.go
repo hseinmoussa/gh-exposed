@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -127,7 +128,8 @@ func TestScanCustomActionAndOutFile(t *testing.T) {
 	if err != nil || !strings.Contains(string(b), "logs: not downloaded") {
 		t.Errorf("report file: %v\n%s", err, b)
 	}
-	if fi, _ := os.Stat(p); fi.Mode().Perm() != 0o600 {
+	// Windows has no Unix permission bits; os.Stat reports 0666 there.
+	if fi, _ := os.Stat(p); runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600 {
 		t.Errorf("report file mode = %v, want 0600 (it names secrets)", fi.Mode().Perm())
 	}
 }
