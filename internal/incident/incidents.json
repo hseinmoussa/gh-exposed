@@ -1,0 +1,85 @@
+[
+  {
+    "id": "tj-actions-changed-files-2025",
+    "title": "tj-actions/changed-files tags rewritten to a secret-dumping commit",
+    "advisory": "GHSA-mrrh-fwg8-r2c3",
+    "cve": "CVE-2025-30066",
+    "url": "https://github.com/advisories/GHSA-mrrh-fwg8-r2c3",
+    "start": "2025-03-14T00:00:00Z",
+    "end": "2025-03-16T00:00:00Z",
+    "window_note": "The advisory gives dates only (March 14 to March 15, 2025), so both whole days (UTC) are scanned.",
+    "payload": "Dumped Runner.Worker memory and printed every secret the job had into the job log, base64-encoded twice. Anyone who can read the run's logs can read the secrets; for a public repository that is everyone.",
+    "targets": [
+      {
+        "action": "tj-actions/changed-files",
+        "malicious_shas": ["0e58ed8671d6b60d0890c21b07f8835ace038e67"],
+        "malicious_shas_complete": true
+      }
+    ],
+    "indicators": ["gist.githubusercontent.com/nikitastupin", "memdump.py"]
+  },
+  {
+    "id": "reviewdog-action-setup-2025",
+    "title": "reviewdog/action-setup@v1 rewritten to a secret-dumping commit",
+    "advisory": "GHSA-qmg3-hpqr-gqvc",
+    "cve": "CVE-2025-30154",
+    "url": "https://github.com/advisories/GHSA-qmg3-hpqr-gqvc",
+    "start": "2025-03-11T18:42:00Z",
+    "end": "2025-03-11T20:31:00Z",
+    "payload": "Dumped secrets into the job log. The listed reviewdog actions call reviewdog/action-setup@v1 internally, so they were affected however they were pinned.",
+    "targets": [
+      {
+        "action": "reviewdog/action-setup",
+        "malicious_shas": ["f0d342d24037bb11d26b9bd8496e0808ba32e9ec"],
+        "malicious_shas_complete": true
+      },
+      { "action": "reviewdog/action-shellcheck", "any_ref": true },
+      { "action": "reviewdog/action-composite-template", "any_ref": true },
+      { "action": "reviewdog/action-staticcheck", "any_ref": true },
+      { "action": "reviewdog/action-ast-grep", "any_ref": true },
+      { "action": "reviewdog/action-typos", "any_ref": true }
+    ],
+    "indicators": []
+  },
+  {
+    "id": "xygeni-action-2026",
+    "title": "xygeni/xygeni-action v5 tag moved to a C2 backdoor",
+    "advisory": "GHSA-f8q5-h5qh-33mh",
+    "cve": "CVE-2026-31976",
+    "url": "https://github.com/advisories/GHSA-f8q5-h5qh-33mh",
+    "start": "2026-03-03T00:00:00Z",
+    "end": "2026-03-11T00:00:00Z",
+    "window_note": "The advisory gives the window as approximately March 3 to 10, 2026, so March 3 00:00 to March 11 00:00 UTC is scanned.",
+    "payload": "Ran a C2 implant that executed attacker commands on the runner for up to 180 seconds. Treat every secret the job could read as stolen; nothing is printed to the log.",
+    "targets": [
+      {
+        "action": "xygeni/xygeni-action",
+        "malicious_shas": ["4bf1d4e19ad81a3e8d4063755ae0f482dd3baf12"],
+        "malicious_shas_complete": true
+      }
+    ],
+    "indicators": ["91.214.78.178", "security-verify.91.214.78.178.nip.io"]
+  },
+  {
+    "id": "trivy-action-2026",
+    "title": "aquasecurity/trivy-action and setup-trivy tags force-pushed to an infostealer",
+    "advisory": "GHSA-69fq-xp46-6x23",
+    "cve": "CVE-2026-33634",
+    "url": "https://github.com/advisories/GHSA-69fq-xp46-6x23",
+    "start": "2026-03-19T17:43:00Z",
+    "end": "2026-03-20T05:40:00Z",
+    "window_note": "trivy-action was exposed 2026-03-19 ~17:43 to 2026-03-20 ~05:40 UTC and setup-trivy 2026-03-19 ~17:43 to ~21:44 UTC. Runs of trivy-action with `version: latest` during the separate trivy binary window are not checked.",
+    "payload": "Dumped Runner.Worker memory, swept the runner for cloud, SSH and Kubernetes credentials, and sent them encrypted to the attacker. Nothing readable is printed to the log. A repository named tpcp-docs in your account means the fallback exfiltration ran.",
+    "targets": [
+      {
+        "action": "aquasecurity/trivy-action",
+        "safe_refs": ["0.35.0", "v0.35.0"]
+      },
+      {
+        "action": "aquasecurity/setup-trivy",
+        "end": "2026-03-19T21:44:00Z"
+      }
+    ],
+    "indicators": ["tpcp-docs"]
+  }
+]
