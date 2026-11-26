@@ -23,6 +23,7 @@ Edit [`internal/incident/incidents.json`](internal/incident/incidents.json) and 
       "malicious_shas": ["<full 40-character SHA>"],
       "malicious_shas_complete": true,
       "safe_refs": ["v2.0.1"],
+      "moved_refs": "tags",
       "any_ref": false
     }
   ],
@@ -35,6 +36,7 @@ Rules:
 - **Cite a GitHub advisory** (`url` must be `https://github.com/advisories/GHSA-...`). Every fact in the entry must come from the advisory or from a source it links.
 - **Use full, lower-case commit SHAs.**
 - Set **`malicious_shas_complete: true` only if the advisory lists every malicious commit.** It lets a clean commit in a log clear a run, so a wrong `true` hides real exposure.
+- Set **`moved_refs: "tags"`** only if the advisory says the attacker moved tags (not branches). A reference to a branch of that name is then cleared.
 - Set **`any_ref: true`** for an action that calls the compromised one internally with a movable ref: it was affected however it was pinned.
 - A target whose window differs from the incident's gets its own `start` / `end`.
 

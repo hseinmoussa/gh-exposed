@@ -12,11 +12,17 @@
     "targets": [
       {
         "action": "tj-actions/changed-files",
-        "malicious_shas": ["0e58ed8671d6b60d0890c21b07f8835ace038e67"],
-        "malicious_shas_complete": true
+        "malicious_shas": [
+          "0e58ed8671d6b60d0890c21b07f8835ace038e67"
+        ],
+        "malicious_shas_complete": true,
+        "moved_refs": "tags"
       }
     ],
-    "indicators": ["gist.githubusercontent.com/nikitastupin", "memdump.py"]
+    "indicators": [
+      "gist.githubusercontent.com/nikitastupin",
+      "memdump.py"
+    ]
   },
   {
     "id": "reviewdog-action-setup-2025",
@@ -30,14 +36,32 @@
     "targets": [
       {
         "action": "reviewdog/action-setup",
-        "malicious_shas": ["f0d342d24037bb11d26b9bd8496e0808ba32e9ec"],
-        "malicious_shas_complete": true
+        "malicious_shas": [
+          "f0d342d24037bb11d26b9bd8496e0808ba32e9ec"
+        ],
+        "malicious_shas_complete": true,
+        "moved_refs": "tags"
       },
-      { "action": "reviewdog/action-shellcheck", "any_ref": true },
-      { "action": "reviewdog/action-composite-template", "any_ref": true },
-      { "action": "reviewdog/action-staticcheck", "any_ref": true },
-      { "action": "reviewdog/action-ast-grep", "any_ref": true },
-      { "action": "reviewdog/action-typos", "any_ref": true }
+      {
+        "action": "reviewdog/action-shellcheck",
+        "any_ref": true
+      },
+      {
+        "action": "reviewdog/action-composite-template",
+        "any_ref": true
+      },
+      {
+        "action": "reviewdog/action-staticcheck",
+        "any_ref": true
+      },
+      {
+        "action": "reviewdog/action-ast-grep",
+        "any_ref": true
+      },
+      {
+        "action": "reviewdog/action-typos",
+        "any_ref": true
+      }
     ],
     "indicators": []
   },
@@ -54,11 +78,17 @@
     "targets": [
       {
         "action": "xygeni/xygeni-action",
-        "malicious_shas": ["4bf1d4e19ad81a3e8d4063755ae0f482dd3baf12"],
-        "malicious_shas_complete": true
+        "malicious_shas": [
+          "4bf1d4e19ad81a3e8d4063755ae0f482dd3baf12"
+        ],
+        "malicious_shas_complete": true,
+        "moved_refs": "tags"
       }
     ],
-    "indicators": ["91.214.78.178", "security-verify.91.214.78.178.nip.io"]
+    "indicators": [
+      "91.214.78.178",
+      "security-verify.91.214.78.178.nip.io"
+    ]
   },
   {
     "id": "trivy-action-2026",
@@ -73,13 +103,20 @@
     "targets": [
       {
         "action": "aquasecurity/trivy-action",
-        "safe_refs": ["0.35.0", "v0.35.0"]
+        "safe_refs": [
+          "0.35.0",
+          "v0.35.0"
+        ],
+        "moved_refs": "tags"
       },
       {
         "action": "aquasecurity/setup-trivy",
-        "end": "2026-03-19T21:44:00Z"
+        "end": "2026-03-19T21:44:00Z",
+        "moved_refs": "tags"
       }
     ],
-    "indicators": ["tpcp-docs"]
+    "indicators": [
+      "tpcp-docs"
+    ]
   }
 ]

@@ -41,10 +41,12 @@ type File struct {
 	Errors []string `json:"errors,omitempty"`
 }
 
+// GitHub expression contexts are case-insensitive (`Secrets.X` works), so
+// every pattern is too. Secret names are reported as written.
 var (
-	secretDot     = regexp.MustCompile(`secrets\.([A-Za-z_][A-Za-z0-9_-]*)`)
-	secretIndex   = regexp.MustCompile(`secrets\s*\[\s*['"]([A-Za-z_][A-Za-z0-9_-]*)['"]\s*\]`)
-	secretDynamic = regexp.MustCompile(`(?i)tojson\(\s*secrets\s*\)|secrets\s*\[\s*[^'"\s]`)
+	secretDot     = regexp.MustCompile(`(?i)\bsecrets\.([A-Za-z_][A-Za-z0-9_-]*)`)
+	secretIndex   = regexp.MustCompile(`(?i)\bsecrets\s*\[\s*['"]([A-Za-z_][A-Za-z0-9_-]*)['"]\s*\]`)
+	secretDynamic = regexp.MustCompile(`(?i)tojson\(\s*secrets\s*\)|\bsecrets\s*\[\s*[^'"\s]`)
 )
 
 // ParseWorkflow parses a workflow file. Workflow-level `env:` that references
@@ -65,7 +67,7 @@ func ParseWorkflow(data []byte) (*File, error) {
 		return out, nil
 	}
 	for i := 0; i+1 < len(jobs.Content); i += 2 {
-		id, body := jobs.Content[i].Value, jobs.Content[i+1]
+		id, body := jobs.Content[i].Value, deref(jobs.Content[i+1])
 		job := Job{ID: id}
 		if u := mapGet(body, "uses"); u != nil && u.Kind == yaml.ScalarNode {
 			out.addUse(&job, u, -1)
@@ -157,16 +159,64 @@ func decode(data []byte) (*yaml.Node, error) {
 	return root, nil
 }
 
+// deref follows YAML aliases (`*name`) to the node they point at. GitHub
+// accepts anchors and aliases in workflow files, so a step list written as
+// `steps: *common` must be read like the original.
+func deref(n *yaml.Node) *yaml.Node {
+	for i := 0; n != nil && n.Kind == yaml.AliasNode && i < 32; i++ {
+		n = n.Alias
+	}
+	return n
+}
+
+// mapGet returns the value for key in a mapping, following aliases and YAML
+// merge keys (`<<: *defaults`). A key written directly wins over a merged one,
+// as YAML specifies. Returned nodes are already dereferenced, and so is every
+// item of a returned sequence.
 func mapGet(n *yaml.Node, key string) *yaml.Node {
-	if n == nil || n.Kind != yaml.MappingNode {
+	return mapGetDepth(n, key, 0)
+}
+
+func mapGetDepth(n *yaml.Node, key string, depth int) *yaml.Node {
+	n = deref(n)
+	if n == nil || n.Kind != yaml.MappingNode || depth > 16 {
 		return nil
 	}
+	var merges []*yaml.Node
 	for i := 0; i+1 < len(n.Content); i += 2 {
-		if n.Content[i].Value == key {
-			return n.Content[i+1]
+		k := n.Content[i].Value
+		if k == key {
+			return normalize(deref(n.Content[i+1]))
+		}
+		if k == "<<" {
+			v := deref(n.Content[i+1])
+			if v != nil && v.Kind == yaml.SequenceNode {
+				merges = append(merges, v.Content...)
+			} else {
+				merges = append(merges, v)
+			}
+		}
+	}
+	for _, m := range merges {
+		if v := mapGetDepth(m, key, depth+1); v != nil {
+			return v
 		}
 	}
 	return nil
+}
+
+// normalize dereferences the items of a sequence so callers can range over
+// them without knowing about aliases.
+func normalize(n *yaml.Node) *yaml.Node {
+	if n == nil || n.Kind != yaml.SequenceNode {
+		return n
+	}
+	cp := *n
+	cp.Content = make([]*yaml.Node, len(n.Content))
+	for i, c := range n.Content {
+		cp.Content[i] = deref(c)
+	}
+	return &cp
 }
 
 // secretRefs collects secret names from every scalar under n. It reads
@@ -174,14 +224,15 @@ func mapGet(n *yaml.Node, key string) *yaml.Node {
 // word "secrets" is not mistaken for an expression.
 func secretRefs(n *yaml.Node) (names []string, all bool) {
 	seen := map[string]bool{}
-	var walk func(*yaml.Node)
-	walk = func(x *yaml.Node) {
-		if x == nil {
+	var walk func(*yaml.Node, int)
+	walk = func(x *yaml.Node, depth int) {
+		x = deref(x)
+		if x == nil || depth > 64 {
 			return
 		}
 		if x.Kind == yaml.ScalarNode {
 			v := x.Value
-			if !strings.Contains(v, "secrets") {
+			if !strings.Contains(strings.ToLower(v), "secrets") {
 				return
 			}
 			for _, m := range secretDot.FindAllStringSubmatch(v, -1) {
@@ -196,10 +247,10 @@ func secretRefs(n *yaml.Node) (names []string, all bool) {
 			return
 		}
 		for _, c := range x.Content {
-			walk(c)
+			walk(c, depth+1)
 		}
 	}
-	walk(n)
+	walk(n, 0)
 	for k := range seen {
 		names = append(names, k)
 	}
