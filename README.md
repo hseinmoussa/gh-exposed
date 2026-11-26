@@ -148,6 +148,7 @@ gh exposed scan
   --repo OWNER/REPO       scan one repository (repeatable)
   --deep                  scan the logs of EVERY run in the window, not only flagged ones
   --no-logs               skip logs (fast; nothing can be confirmed or cleared)
+  --rerun-lookback-days N also list runs created up to N days (1-30, default 30) before the window, to catch re-runs inside it
   --format text|markdown|json   --out FILE   --fail-on possible|confirmed|never
   --concurrency N (default 4)   --max-log-mb N (default 500)   --api-url URL (GitHub Enterprise Server)
 ```
@@ -165,6 +166,9 @@ The token comes from `GH_TOKEN`, then `GITHUB_TOKEN`, then `gh auth token`. Ever
 - **Tags have no history.** A composite action reached through a movable ref is expanded from that ref's content *today*. A nested call the attacker added and later removed is invisible in the files. `--deep` reads every run's log to catch it while logs exist.
 - **Pull requests** run the workflow from the merge commit; gh-exposed reads it at the pull request's head commit, which almost always holds the same workflow.
 - **Local actions inside another repository's reusable workflow** are read from that workflow's repository; at run time GitHub may resolve them against the caller's checkout instead.
+- **Refs are judged as they are today.** Whether a ref is a branch or a tag is read now; a name that was both during the window and lost its tag in the clean-up is treated as a branch.
+- **Runs deleted by hand** are invisible. If a repository deleted its runs from the window but kept older ones, the history check cannot tell; use `usage` and the workflow history to check by hand.
+- **Re-runs more than `--rerun-lookback-days` after a run was created** are not seen. GitHub allows re-runs for 30 days, the default.
 - **More than 1,000 runs within two seconds** in one repository cannot be listed completely (GitHub caps a filtered listing at 1,000 results).
 - **Environment secrets** are not listed by name; a job that reads all secrets is reported as "every secret this repository can use".
 - **Runs, not artifacts.** It does not check binaries, images or packages a compromised run produced.

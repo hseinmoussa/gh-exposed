@@ -185,13 +185,13 @@ func scanDoc(w io.Writer, r *scan.Report, md bool) error {
 			break
 		}
 		if s.HistoryGaps > 0 {
-			d.p("No run in the window executed the compromised code, but %d repositories have no run history that reaches the window, so this is not a complete answer for them (see their notes).", s.HistoryGaps)
+			d.p("No listed run in the window executed the compromised code. For %d repositories GitHub no longer lists runs from the window, so their workflow files from the window were checked instead and none used the action in an exposed way (see their notes).", s.HistoryGaps)
 		} else {
 			d.p("No run in the scanned repositories executed the compromised code.")
 		}
 	}
 	if r.Incomplete() {
-		d.p("THIS RESULT IS INCOMPLETE: %d repositories could not be scanned and %d runs could not be assessed (their workflow file could not be read and their logs did not settle it). Re-run the scan; their details are below.", s.RepoErrs, s.Unassessed)
+		d.p("THIS RESULT IS INCOMPLETE: %d repositories could not be scanned, %d were only partly checked, and %d runs could not be assessed (a workflow or nested action could not be read and the logs did not settle it). Re-run the scan; the details are below.", s.RepoErrs, s.ReposPartial, s.Unassessed)
 	}
 	if s.PossibleFiles > 0 {
 		d.p("%d workflow file(s) in repositories whose run history GitHub no longer keeps used the action with a movable ref during the window. Any run of them in the window executed the compromised code; their secrets are in the rotation list.", s.PossibleFiles)
@@ -211,7 +211,7 @@ func scanDoc(w io.Writer, r *scan.Report, md bool) error {
 
 	var flagged []scan.RepoResult
 	for _, repo := range r.Repos {
-		if len(repo.Runs) > 0 || repo.Error != "" || len(repo.Notes) > 0 {
+		if len(repo.Runs) > 0 || repo.Error != "" || len(repo.Notes) > 0 || len(repo.Incomplete) > 0 {
 			flagged = append(flagged, repo)
 		}
 	}
@@ -223,10 +223,13 @@ func scanDoc(w io.Writer, r *scan.Report, md bool) error {
 		if repo.Error != "" {
 			d.p("Could not scan: %s", repo.Error)
 		}
+		for _, n := range repo.Incomplete {
+			d.item("NOT CHECKED: %s", n)
+		}
 		for _, n := range repo.Notes {
 			d.item("%s", n)
 		}
-		if len(repo.Notes) > 0 {
+		if len(repo.Notes) > 0 || len(repo.Incomplete) > 0 {
 			fmt.Fprintln(d.w)
 		}
 		runs := append([]scan.RunResult{}, repo.Runs...)
@@ -253,7 +256,7 @@ func scanDoc(w io.Writer, r *scan.Report, md bool) error {
 				d.item("evidence: %s", e)
 			}
 			if run.Unassessed {
-				d.item("NOT ASSESSED: the workflow file could not be read, and the logs did not settle it")
+				d.item("NOT ASSESSED: a workflow or nested action could not be read, and the logs did not settle it")
 			}
 			for _, x := range run.Reasons {
 				d.item("%s", x)

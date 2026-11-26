@@ -1,8 +1,11 @@
 package workflow
 
 import (
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseRef(t *testing.T) {
@@ -230,5 +233,35 @@ jobs:
 	}
 	if o := byID["override"]; len(o.Uses) != 1 || !o.Uses[0].Ref.Matches("actions/checkout") {
 		t.Errorf("a key written directly must win over a merged one: %+v", o.Uses)
+	}
+}
+
+func TestAliasBombIsRefused(t *testing.T) {
+	// 9 levels of 10 aliases each: about 700 bytes that expand to 10^9 nodes.
+	var b strings.Builder
+	b.WriteString("a0: &a0 [\"${{ secrets.X }}\"]\n")
+	for i := 1; i <= 9; i++ {
+		fmt.Fprintf(&b, "a%d: &a%d [", i, i)
+		for j := 0; j < 10; j++ {
+			if j > 0 {
+				b.WriteString(",")
+			}
+			fmt.Fprintf(&b, "*a%d", i-1)
+		}
+		b.WriteString("]\n")
+	}
+	b.WriteString("jobs:\n  x:\n    env: { E: *a9 }\n    steps: []\n")
+	done := make(chan error, 1)
+	go func() { _, err := ParseWorkflow([]byte(b.String())); done <- err }()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "refusing") {
+			t.Errorf("want a refusal, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ParseWorkflow did not return within 5 seconds on an alias bomb")
+	}
+	if _, err := ParseAction([]byte(strings.Replace(b.String(), "jobs:", "runs:\n  using: composite\nxjobs:", 1))); err == nil {
+		t.Error("ParseAction must refuse an alias bomb too")
 	}
 }

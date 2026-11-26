@@ -232,6 +232,7 @@ func cmdScan(ctx context.Context, args []string, env Env) int {
 	deep := fs.Bool("deep", false, "scan the logs of EVERY run in the window, not only runs the workflow files flag")
 	maxLog := fs.Int("max-log-mb", 500, "largest run log archive to download, in MiB")
 	failOn := fs.String("fail-on", "possible", "exit non-zero on: possible, confirmed, or never")
+	lookback := fs.Int("rerun-lookback-days", 30, "also list runs created this many days before the window, to catch re-runs inside it (1-30; lower is faster)")
 	fs.Usage = func() { fmt.Fprintln(env.Stderr, "Usage: gh exposed scan [flags]"); fs.PrintDefaults() }
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -258,6 +259,10 @@ func cmdScan(ctx context.Context, args []string, env Env) int {
 	}
 	if *maxLog < 1 {
 		fmt.Fprintln(env.Stderr, "--max-log-mb must be at least 1")
+		return ExitUsage
+	}
+	if *lookback < 1 || *lookback > 30 {
+		fmt.Fprintln(env.Stderr, "--rerun-lookback-days must be between 1 and 30")
 		return ExitUsage
 	}
 	if *noLogs && *deep {
@@ -307,7 +312,8 @@ func cmdScan(ctx context.Context, args []string, env Env) int {
 	rep, err := scan.Run(ctx, env.NewSource(c.apiURL, tok), scan.Options{
 		Incident: in, Repos: c.repos, Owners: c.owners,
 		Logs: !*noLogs, Deep: *deep, MaxLogBytes: int64(*maxLog) << 20, Concurrency: c.concurrency,
-		Progress: func(s string) { fmt.Fprintln(env.Stderr, s) },
+		RerunLookback: time.Duration(*lookback) * 24 * time.Hour,
+		Progress:      func(s string) { fmt.Fprintln(env.Stderr, s) },
 	})
 	if err != nil {
 		fmt.Fprintln(env.Stderr, "scan failed:", err)

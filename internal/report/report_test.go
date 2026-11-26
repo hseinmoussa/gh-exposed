@@ -123,7 +123,7 @@ func TestHistoryGapRendering(t *testing.T) {
 	r.Summary.PossibleFiles = 0
 	b.Reset()
 	_ = Scan(&b, Text, r)
-	if !strings.Contains(b.String(), "not a complete answer") {
-		t.Errorf("a clean result with history gaps must say it is incomplete:\n%s", b.String())
+	if !strings.Contains(b.String(), "workflow files from the window were checked instead") {
+		t.Errorf("a clean result with history gaps must say what was checked:\n%s", b.String())
 	}
 }

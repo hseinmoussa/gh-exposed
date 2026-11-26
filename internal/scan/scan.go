@@ -29,6 +29,9 @@ type Options struct {
 	Deep        bool
 	MaxLogBytes int64
 	Concurrency int
+	// RerunLookback is how far before the window runs are listed, to catch a
+	// run re-run inside it. Default 30 days (GitHub's re-run limit).
+	RerunLookback time.Duration
 	// Progress, if set, receives one line per repository as it finishes.
 	Progress func(string)
 }
@@ -93,6 +96,9 @@ type RepoResult struct {
 	RepoSecrets []string `json:"repo_secrets,omitempty"`
 	Notes       []string `json:"notes,omitempty"`
 	Error       string   `json:"error,omitempty"`
+	// Incomplete lists parts of this repository that could not be checked.
+	// Any entry makes the whole scan incomplete: never reported as clean.
+	Incomplete []string `json:"incomplete,omitempty"`
 }
 
 // Rotation is one secret to rotate.
@@ -116,6 +122,7 @@ type Summary struct {
 	// window; PossibleFiles counts workflow files flagged in them.
 	HistoryGaps   int `json:"repos_without_run_history"`
 	Unassessed    int `json:"runs_not_assessed"`
+	ReposPartial  int `json:"repos_partly_checked"`
 	PossibleFiles int `json:"workflow_files_possible"`
 }
 
@@ -133,7 +140,7 @@ type Report struct {
 // Incomplete reports whether part of the scan failed, so "nothing found"
 // must not be read as "nothing happened".
 func (r *Report) Incomplete() bool {
-	return r.Summary.RepoErrs > 0 || r.Summary.Unassessed > 0
+	return r.Summary.RepoErrs > 0 || r.Summary.Unassessed > 0 || r.Summary.ReposPartial > 0
 }
 
 // Worst returns the most severe verdict in the report.
@@ -158,7 +165,10 @@ func Run(ctx context.Context, src Source, o Options) (*Report, error) {
 	if o.MaxLogBytes <= 0 {
 		o.MaxLogBytes = 500 << 20
 	}
-	repos, err := listTargets(ctx, src, o)
+	if o.RerunLookback == 0 {
+		o.RerunLookback = 30 * 24 * time.Hour
+	}
+	repos, repoErrs, err := listTargets(ctx, src, o)
 	if err != nil {
 		return nil, err
 	}
@@ -173,7 +183,11 @@ func Run(ctx context.Context, src Source, o Options) (*Report, error) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			results[i] = scanRepo(ctx, src, res, o, repo)
+			if e := repoErrs[strings.ToLower(repo.FullName)]; e != nil {
+				results[i] = RepoResult{Repo: repo.FullName, Visibility: "unknown", Error: e.Error()}
+			} else {
+				results[i] = scanRepo(ctx, src, res, o, repo)
+			}
 			if o.Progress != nil {
 				r := results[i]
 				o.Progress(fmt.Sprintf("%s: %d runs in window, %d flagged", r.Repo, r.RunsInWindow, len(r.Runs)))
@@ -193,6 +207,9 @@ func Run(ctx context.Context, src Source, o Options) (*Report, error) {
 		}
 		if !r.HistoryComplete && r.Error == "" {
 			rep.Summary.HistoryGaps++
+		}
+		if len(r.Incomplete) > 0 {
+			rep.Summary.ReposPartial++
 		}
 		for _, run := range r.Runs {
 			if run.Kind == KindWorkflowFile {
@@ -218,7 +235,11 @@ func Run(ctx context.Context, src Source, o Options) (*Report, error) {
 	return rep, nil
 }
 
-func listTargets(ctx context.Context, src Source, o Options) ([]ghapi.Repo, error) {
+// listTargets resolves --owner and --repo into repositories. A --repo that
+// cannot be read is still returned, with its error, so the report names it
+// instead of silently dropping it.
+func listTargets(ctx context.Context, src Source, o Options) ([]ghapi.Repo, map[string]error, error) {
+	errs := map[string]error{}
 	seen := map[string]bool{}
 	var out []ghapi.Repo
 	add := func(r ghapi.Repo) {
@@ -231,7 +252,7 @@ func listTargets(ctx context.Context, src Source, o Options) ([]ghapi.Repo, erro
 	for _, owner := range o.Owners {
 		rs, err := src.ListRepos(ctx, owner)
 		if err != nil {
-			return nil, fmt.Errorf("list repositories of %s: %w", owner, err)
+			return nil, nil, fmt.Errorf("list repositories of %s: %w", owner, err)
 		}
 		for _, r := range rs {
 			add(r)
@@ -243,14 +264,19 @@ func listTargets(ctx context.Context, src Source, o Options) ([]ghapi.Repo, erro
 			// Keep going: report the repository with its error rather than
 			// abandoning the whole scan.
 			r = ghapi.Repo{FullName: name, Visibility: "unknown"}
+			msg := "could not read the repository: " + shortErr(err)
+			if errors.Is(err, ghapi.ErrNotFound) {
+				msg = "repository not found, or this token cannot see it"
+			}
+			errs[strings.ToLower(name)] = errors.New(msg)
 		}
 		add(r)
 	}
 	if len(out) == 0 {
-		return nil, errors.New("no repositories to scan: pass --repo or --owner")
+		return nil, nil, errors.New("no repositories to scan: pass --repo or --owner")
 	}
 	sort.Slice(out, func(i, j int) bool { return strings.ToLower(out[i].FullName) < strings.ToLower(out[j].FullName) })
-	return out, nil
+	return out, errs, nil
 }
 
 func visibility(r ghapi.Repo) string {
@@ -277,10 +303,15 @@ func scanRepo(ctx context.Context, src Source, res *resolver, o Options, repo gh
 			end = e
 		}
 	}
-	// A run created shortly before the window can still be executing inside
-	// it (a long job, a job waiting on `needs:`), so the listing starts a day
-	// early and each run is then kept only if its active time overlaps.
-	listed, err := src.ListRuns(ctx, repo.FullName, start.Add(-runLead), end)
+	// A run created before the window can still have executed inside it: a
+	// long job or one waiting on `needs:` (up to a day), or a re-run (GitHub
+	// allows re-runs for 30 days). The listing therefore starts RerunLookback
+	// early, and each run is kept only if it was active inside the window.
+	lookback := o.RerunLookback
+	if lookback < runLead {
+		lookback = runLead
+	}
+	listed, err := src.ListRuns(ctx, repo.FullName, start.Add(-lookback), end)
 	if err != nil {
 		out.Error = "list runs: " + ghapi.RedactText(err.Error())
 		return out
@@ -290,7 +321,10 @@ func scanRepo(ctx context.Context, src Source, res *resolver, o Options, repo gh
 	spanUnknown := 0
 	for _, r := range listed {
 		from, to := runActive(r)
-		if to.Before(start) && r.CreatedAt.Before(start) {
+		// Only runs created within the last day before the window can have
+		// a first attempt still running in it; older ones count only through
+		// a re-run, which runActive sees in run_started_at.
+		if to.Before(start) && r.CreatedAt.Before(start) && !r.CreatedAt.Before(start.Add(-runLead)) {
 			// Created before the window: did any job still run inside it?
 			// Only the jobs know; the run's updated_at cannot be trusted.
 			_, last, err := src.RunJobsSpan(ctx, repo.FullName, r.ID)
@@ -298,6 +332,8 @@ func scanRepo(ctx context.Context, src Source, res *resolver, o Options, repo gh
 			case err != nil:
 				spanUnknown++
 				to = r.UpdatedAt // cautious: include it if it might overlap
+			case last.IsZero():
+				continue // the run never started a job
 			case last.After(to):
 				to = last
 			}
@@ -317,16 +353,20 @@ func scanRepo(ctx context.Context, src Source, res *resolver, o Options, repo gh
 	// still lists ANY run from before the window.
 	if repo.CreatedAt.IsZero() || repo.CreatedAt.Before(start) {
 		n, err := src.CountRunsCreatedBefore(ctx, repo.FullName, start)
-		switch {
-		case err != nil:
-			out.Notes = append(out.Notes, "could not check how far back the run history goes ("+shortErr(err)+"); an empty result may be incomplete")
-		case n == 0:
+		if err != nil || n == 0 {
 			out.HistoryComplete = false
-			out.Notes = append(out.Notes, "GitHub lists no run of this repository from before the window, so runs inside it may have been deleted; its workflows from the window were checked instead")
-			files, note := historyFallback(ctx, src, res, in, repo, end)
+			if err != nil {
+				out.Notes = append(out.Notes, "could not check how far back the run history goes ("+shortErr(err)+"), so its workflows from the window were checked as well")
+			} else {
+				out.Notes = append(out.Notes, "GitHub lists no run of this repository from before the window, so runs inside it may have been deleted; its workflows from the window were checked instead")
+			}
+			files, note, failure := historyFallback(ctx, src, res, in, repo, end)
 			out.Runs = append(out.Runs, files...)
 			if note != "" {
 				out.Notes = append(out.Notes, note)
+			}
+			if failure != "" {
+				out.Incomplete = append(out.Incomplete, failure)
 			}
 		}
 	}
@@ -362,13 +402,14 @@ func scanRepo(ctx context.Context, src Source, res *resolver, o Options, repo gh
 		out.Error = err.Error()
 		return out
 	}
-	needRepoSecrets := false
 	for _, s := range slots {
-		if !s.keep {
-			continue
+		if s.keep {
+			out.Runs = append(out.Runs, s.rr)
 		}
-		out.Runs = append(out.Runs, s.rr)
-		if s.rr.AllSecrets && s.rr.Verdict != incident.NotAffected {
+	}
+	needRepoSecrets := false
+	for _, r := range out.Runs { // runs and fallback workflow files alike
+		if r.AllSecrets && r.Verdict != incident.NotAffected {
 			needRepoSecrets = true
 		}
 	}
@@ -451,10 +492,23 @@ func scanRun(ctx context.Context, src Source, res *resolver, o Options, repo gha
 			rr.Unassessed = true
 			rr.Reasons = append(rr.Reasons, st.err)
 		}
+		if len(st.nested) > 0 && rr.Verdict == incident.NotAffected {
+			rr.Unassessed = true
+			rr.Reasons = append(rr.Reasons, dedupe(st.nested)...)
+		}
 	case run.Path != "":
 		rr.Reasons = append(rr.Reasons, "run of "+run.Path+" has no workflow file in the repository (a GitHub-managed workflow); only its logs can show what ran")
 	}
 	staticHit := len(rr.Jobs) > 0
+
+	// A run that never started a job executed nothing, whatever its
+	// workflow says. Checked only for flagged runs: one extra call each.
+	if rr.Verdict == incident.Possible {
+		if _, last, err := src.RunJobsSpan(ctx, repo.FullName, run.ID); err == nil && last.IsZero() {
+			rr.Verdict = incident.NotAffected
+			rr.Reasons = append(rr.Reasons, "the run never started a job (for example it was waiting for approval), so it executed nothing")
+		}
+	}
 
 	// 2. Log evidence.
 	wantLogs := o.Logs && (rr.Verdict == incident.Possible || o.Deep || rr.Unassessed)
@@ -520,6 +574,9 @@ type static struct {
 	everySecret map[string]bool
 	everyAll    bool
 	err         string
+	// nested lists composite actions or called workflows that exist but
+	// could not be read: a compromised call may hide behind them.
+	nested []string
 }
 
 // assessWorkflow judges one workflow file at one commit. active, when not
@@ -544,7 +601,9 @@ func assessWorkflow(ctx context.Context, res *resolver, in incident.Incident, re
 		if job.AllSecrets {
 			st.everyAll = true
 		}
-		found := res.expand(ctx, repo, sha, job.Uses, path+"@"+short(sha), nil, 0, map[string]bool{})
+		x := newExpansion()
+		found := res.expand(ctx, repo, sha, job.Uses, path+"@"+short(sha), nil, 0, x)
+		st.nested = append(st.nested, x.failures...)
 		jobHit := false
 		for _, f := range found {
 			for _, t := range in.Targets {
@@ -589,21 +648,29 @@ func assessWorkflow(ctx context.Context, res *resolver, in incident.Incident, re
 // at the end of the window and reports each one that used a compromised
 // action with a movable ref as possible: if it ran in the window, it ran the
 // malicious code, and nothing left on GitHub can say whether it ran.
-func historyFallback(ctx context.Context, src Source, res *resolver, in incident.Incident, repo ghapi.Repo, end time.Time) ([]RunResult, string) {
+//
+// It returns the flagged files, a note for the report, and a non-empty
+// failure when part of the fallback could not be done: the repository is
+// then incomplete, never clean.
+func historyFallback(ctx context.Context, src Source, res *resolver, in incident.Incident, repo ghapi.Repo, end time.Time) ([]RunResult, string, string) {
 	if repo.DefaultBranch == "" {
-		return nil, "the default branch is unknown, so the workflows from the window could not be read"
+		return nil, "", "the default branch is unknown, so the workflows from the window could not be read"
 	}
 	sha, err := src.CommitAt(ctx, repo.FullName, repo.DefaultBranch, end)
+	if errors.Is(err, ghapi.ErrNotFound) {
+		return nil, "the repository had no commit on " + repo.DefaultBranch + " before the end of the window", ""
+	}
 	if err != nil {
-		return nil, "could not find the " + repo.DefaultBranch + " commit at the end of the window: " + shortErr(err)
+		return nil, "", "could not find the " + repo.DefaultBranch + " commit at the end of the window: " + shortErr(err)
 	}
 	files, err := src.ListDir(ctx, repo.FullName, ".github/workflows", sha)
 	if errors.Is(err, ghapi.ErrNotFound) {
-		return nil, "the repository had no workflows on " + repo.DefaultBranch + " at the end of the window (commit " + short(sha) + ")"
+		return nil, "the repository had no workflows on " + repo.DefaultBranch + " at the end of the window (commit " + short(sha) + ")", ""
 	}
 	if err != nil {
-		return nil, "could not list the workflows at " + short(sha) + ": " + shortErr(err)
+		return nil, "", "could not list the workflows at " + short(sha) + ": " + shortErr(err)
 	}
+	var failures []string
 	var out []RunResult
 	cleared := 0
 	for _, name := range files {
@@ -612,7 +679,14 @@ func historyFallback(ctx context.Context, src Source, res *resolver, in incident
 		}
 		p := ".github/workflows/" + name
 		st := assessWorkflow(ctx, res, in, repo.FullName, p, sha, nil)
+		if st.err != "" {
+			failures = append(failures, p+": "+st.err)
+			continue
+		}
 		if st.verdict != incident.Possible {
+			if len(st.nested) > 0 {
+				failures = append(failures, st.nested...)
+			}
 			if len(st.jobs) > 0 {
 				cleared++
 			}
@@ -632,13 +706,17 @@ func historyFallback(ctx context.Context, src Source, res *resolver, in incident
 		sort.Strings(rr.Secrets)
 		out = append(out, rr)
 	}
-	switch {
-	case len(out) == 0 && cleared == 0:
-		return nil, "none of its workflows on " + repo.DefaultBranch + " at the end of the window (commit " + short(sha) + ") used a compromised action"
-	case cleared > 0:
-		return out, fmt.Sprintf("%d workflow(s) at commit %s used a compromised action in a way that was not exposed (for example pinned to a commit SHA)", cleared, short(sha))
+	failure := ""
+	if len(failures) > 0 {
+		failure = "some workflows from the window could not be checked: " + strings.Join(dedupe(failures), "; ")
 	}
-	return out, ""
+	switch {
+	case len(out) == 0 && cleared == 0 && failure == "":
+		return nil, "none of its workflows on " + repo.DefaultBranch + " at the end of the window (commit " + short(sha) + ") used a compromised action", ""
+	case cleared > 0:
+		return out, fmt.Sprintf("%d workflow(s) at commit %s used a compromised action in a way that was not exposed (for example pinned to a commit SHA)", cleared, short(sha)), failure
+	}
+	return out, "", failure
 }
 
 func possibleSummary(rr RunResult) string {
